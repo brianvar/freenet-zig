@@ -1,0 +1,10 @@
+.{
+    .name = .freenet_counter_example,
+    .version = "0.1.0",
+    .fingerprint = 0x2d2c19fbaaaf4816,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .freenet = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "web", "README.md" },
+}
