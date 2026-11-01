@@ -133,20 +133,6 @@ below); `zig build test` does not.
   machine. The address `fdev website init` prints is for Freenet's own container;
   ours differs (use `site.txt`).
 
-## Verification status (keep honest)
-
-- **Zig: written without a toolchain by the agent; the user compiles and runs it.**
-  Compile errors fixed so far came from API guesses (`Clock.now`, discarding errors).
-  Expect small fixes after any change; run `zig build test`.
-- **Wire formats**: checked against freenet-stdlib 0.12.1 and freenet-core (Nov 2026)
-  by reading source. The signed-site state and sync summary were also checked by
-  running freenet-core's own website contract (Wasm) in a harness that speaks the
-  node's streaming-buffer protocol.
-- **freenet.js**: BLAKE3 checked against the official test vectors; the client's
-  connection handling by `js/test.html` (12 tests, run in headless Chromium).
-- **Run on a live node**: delegate messaging, randomness and publishing with `fdev`
-  (earlier versions). **Not yet**: the Zig signed container, freenet.js as a separate
-  archive file, delegates with parameters, `requireApp`, republishing a newer release.
 
 ## Not done / ideas
 

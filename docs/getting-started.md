@@ -26,7 +26,7 @@ my-app/
 └── web/index.html
 ```
 
-`build.zig.zon`:
+`build.zig.zon` (without the dependency for now):
 
 ```zig
 .{
@@ -34,11 +34,15 @@ my-app/
     .version = "0.1.0",
     .fingerprint = 0x0, // `zig build` prints the value to put here
     .minimum_zig_version = "0.17.0",
-    .dependencies = .{
-        .freenet = .{ .path = "../freenet-zig" },
-    },
+    .dependencies = .{},
     .paths = .{ "build.zig", "build.zig.zon", "src", "web" },
 }
+```
+
+Then add freenet-zig from GitHub, which fills in `.dependencies`:
+
+```sh
+zig fetch --save git+https://github.com/brianvar/freenet-zig
 ```
 
 ## 2. The delegate

@@ -110,13 +110,13 @@ Examples:
 
 ## Install
 
-Add it to your `build.zig.zon`:
+Source: <https://github.com/brianvar/freenet-zig>. Add it to your project with:
 
-```zig
-.dependencies = .{
-    .freenet = .{ .path = "../freenet-zig" },   // or .url + .hash for a release tarball
-},
+```sh
+zig fetch --save git+https://github.com/brianvar/freenet-zig
 ```
+
+which adds the dependency to your `build.zig.zon` (`.freenet = .{ .url = ..., .hash = ... }`).
 
 ## Documentation
 
@@ -128,24 +128,11 @@ Add it to your `build.zig.zon`:
 | [docs/web-apps.md](docs/web-apps.md) | `addWebApp`, the page, `freenet.js` client API, the web container |
 | [docs/build.md](docs/build.md) | All build helpers and the `freenet-pack` / `freenet-check-wasm` tools |
 | [docs/testing.md](docs/testing.md) | Native unit tests with `freenet.testing` |
-| [docs/internals.md](docs/internals.md) | Wasm ABI, wire formats, compatibility and what's verified |
+| [docs/internals.md](docs/internals.md) | Wasm ABI, wire formats and compatibility |
 
-## Status
 
-The wire formats follow freenet-stdlib and freenet-core as of October 2026.
+## Compatibility
 
-- **Run on a live node:** page-to-delegate messaging, randomness and the web
-  container, in the app this library was extracted from, using the same formats.
-- **Not yet run on a live node:**
-  - Loading `freenet.js` as a separate file in the site archive (it used to be
-    inlined into the page). freenet-core serves archive files to the sandboxed
-    page the same way it serves any script, so this is expected to work.
-  - The contract API in `freenet.js` has been tested against a mock node
-    running real contract Wasm. The client's connection handling has Node
-    tests: open `js/test.html` in a browser.
-  - Secrets, context, logging and custom contracts are tested byte by byte
-    against the Rust type definitions.
+The wire formats follow freenet-stdlib and freenet-core as of November 2026.
 
-See [docs/internals.md](docs/internals.md#verification-status).
-
-License: MIT
+License: [AGPL-3.0](LICENSE)

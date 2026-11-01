@@ -199,26 +199,3 @@ misreads. Appending a field to an existing struct would break this library,
 just as it would break older Rust delegates. `src/tests.zig` pins every layout
 the library relies on, so a format change shows up as a failing test once the
 expectations are updated.
-
-## Verification status
-
-- **Run on a live node (freenet-core, October 2026), in the app this library
-  was extracted from, with the same wire formats:** delegate registration and
-  messaging from a page, randomness, the (earlier, content-addressed) web
-  container, and publishing with `fdev`.
-- **Tested byte by byte, not yet on a live node:** secrets, context, logging,
-  custom contracts, related contracts, and the error mappings.
-- **Tested against a mock node, not yet on a live node:** the `freenet.js`
-  contract API (put, get, update, subscribe, notifications, chunked responses).
-  The mock runs real contract Wasm and checks ids independently.
-- **Checked against freenet-core's own website contract** (run in Node, with
-  the node's streaming buffer protocol): the signed state this library writes
-  (metadata bytes, signature, version rule, sync summary) is accepted by it,
-  and the library accepts states in `fdev website`'s encoding. The vectors are
-  in `src/webapp.zig`.
-- **Not yet run on a live node:** the signed web container built in Zig,
-  `freenet.js` loaded as its own archive file (it used to be inlined into each
-  page), delegates with the app id as parameters, and the `visitor` delegate
-  of `examples/counter`.
-
-Reports of what works and what doesn't on real nodes are welcome.

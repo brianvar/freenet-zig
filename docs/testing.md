@@ -109,5 +109,5 @@ Besides your tests, this runs `freenet-check-wasm` on the compiled modules. See
 
 - The page's JavaScript: test it in a browser against a local node. (The
   client library itself has tests: open `js/test.html` in a browser.)
-- The real node's behavior. See [internals.md](internals.md#verification-status)
-  for what has run on a live node.
+- The real node's behavior: run your app on a local node
+  ([getting-started.md](getting-started.md#5-run-it-on-a-local-node)).
