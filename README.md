@@ -105,8 +105,6 @@ Examples:
 - [examples/counter](examples/counter): a shared counter. A contract with a
   commutative merge, a delegate that keeps each visitor's id, and a page that
   uses both.
-- [freenet-zig-random](../freenet-zig-random): a page plus a delegate that
-  generates random numbers.
 
 ## Install
 
@@ -115,8 +113,6 @@ Source: <https://github.com/brianvar/freenet-zig>. Add it to your project with:
 ```sh
 zig fetch --save git+https://github.com/brianvar/freenet-zig
 ```
-
-which adds the dependency to your `build.zig.zon` (`.freenet = .{ .url = ..., .hash = ... }`).
 
 ## Documentation
 
