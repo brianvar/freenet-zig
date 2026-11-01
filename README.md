@@ -2,6 +2,11 @@
 
 Write [Freenet](https://freenet.org) delegates, contracts and web apps in Zig.
 
+> **Unofficial.** This is a community project, not made, endorsed or supported by
+> The Freenet Project. It follows the wire formats of the official Rust SDK
+> (freenet-stdlib) and node (freenet-core) but is not part of them. If something
+> doesn't work, check here before reporting it to Freenet.
+
 Freenet apps are WebAssembly modules plus a web page. Freenet itself only ships
 a Rust SDK. This library covers the same ground for Zig:
 

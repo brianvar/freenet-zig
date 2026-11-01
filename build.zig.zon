@@ -11,5 +11,6 @@
         "tools",
         "js/freenet.js",
         "README.md",
+        "AGENTS.md",
     },
 }
