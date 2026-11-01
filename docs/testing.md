@@ -31,14 +31,17 @@ test "random replies are in range" {
 |---|---|
 | `reset()` | fresh fake node: seeded random, no secrets, empty context, instance id set |
 | `ask(Impl, payload, opts) ![]const []const u8` | send an `ApplicationMessage` and return the reply payloads. Fails with `error.DelegateReturnedError` (printing the message) if the delegate errored |
-| `send(Impl, inbound, opts) !delegate.Result` | send any `Inbound`. Result is `.ok` (outbound messages, including `.context_updated`) or `.err` (the error message) |
+| `send(Impl, inbound, opts) !Result` | send any `Inbound`. Result is `.ok` (the reply payloads) or `.err` (the error message) |
 | `setRandom(fn ([]u8) void)` | control randomness |
 | `clearInstanceId()` | simulate a node that never called `__frnt_set_id` |
 | `setLog(fn ([]const u8) void)` | capture log output |
 | `putSecret(key, value)` / `secret(key)` | seed or inspect the secret store |
+| `context()` | the delegate context as the last call left it |
 
 `opts` is `SendOptions{ .origin = ..., .parameters = ... }`. The default origin
-is a web app whose id is 32 bytes of `7`.
+is a web app whose id is 32 bytes of `7`, and the default parameters are empty.
+A delegate that calls `d.requireApp()` needs the parameters to match, as
+`freenet-pack` sets them: `.{ .parameters = &([_]u8{7} ** 32) }`.
 
 ### Forcing edge cases
 
@@ -75,7 +78,7 @@ test "merges deltas" {
 | `summarize(Impl, params, state)` | `Outcome([]const u8)` |
 | `delta(Impl, params, state, summary)` | `Outcome([]const u8)` |
 
-`Outcome(T)` is `.ok: T` or `.err: ContractError`, where `ContractError` is a
+`Outcome(T)` is `.ok: T` or `.err: t.ContractError`, where `ContractError` is a
 union of `deser`, `invalid_update`, `invalid_update_with_info`, `invalid_state`,
 `invalid_delta` and `other`.
 
@@ -92,12 +95,11 @@ with hand-written expected bytes.
 ## Wiring into build.zig
 
 ```zig
-const tests = freenet.addTests(b, dep, .{
+freenet.addTests(b, dep, b.step("test", "Run tests"), .{
     .sources = &.{b.path("src/delegate.zig")},
     .delegates = &.{my_delegate},
     .contracts = &.{app.contract},
 });
-b.step("test", "Run tests").dependOn(tests);
 ```
 
 Besides your tests, this runs `freenet-check-wasm` on the compiled modules. See
@@ -105,6 +107,7 @@ Besides your tests, this runs `freenet-check-wasm` on the compiled modules. See
 
 ## What native tests don't cover
 
-- The page's JavaScript: test it in a browser against a local node.
+- The page's JavaScript: test it in a browser against a local node. (The
+  client library itself has tests: open `js/test.html` in a browser.)
 - The real node's behavior. See [internals.md](internals.md#verification-status)
   for what has run on a live node.

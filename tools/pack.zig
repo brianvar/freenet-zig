@@ -1,24 +1,39 @@
-//! freenet-pack: turns a web page (plus delegates) into a publishable web app.
-//! Needs nothing but Zig. Normally invoked through `addWebApp` in build.zig.
+//! freenet-pack: turns a web page (plus delegates) into a publishable, signed
+//! web app. Needs nothing but Zig. Normally invoked through `addWebApp` in
+//! build.zig.
 //!
 //!   freenet-pack --web-contract <web_container.wasm> --client <freenet.js> --out-dir <dir>
+//!                --key <key file> [--version <n>]
 //!                --file index.html=<path> [--file <name>=<path>]...
 //!                [--delegate <name>=<delegate.wasm>]...
 //!                [--embed-contract <name>=<contract.wasm>]...
 //!
-//! * In every `.html` file, `<script src="freenet.js"></script>` is replaced
-//!   with the inlined client plus the embedded delegates (Wasm + keys) and
-//!   contracts (Wasm + code hash).
-//! * The files are packed into `web.tar.xz` and the web-app state.
-//! * Parameters = BLAKE3(state) (what the built-in web container expects).
+//! * `--key` is the *name* of a key made by `fdev website init <name>`
+//!   (freenet-core's own tool). It is looked up where `fdev` keeps it,
+//!   `<config dir>/freenet/website-keys/<name>.toml`, so projects name a key
+//!   and each machine has its own copy. A value with a `/` or `\` or ending in
+//!   `.toml` or `.key` is taken as a file path instead (for CI), either an
+//!   `fdev` file or just the 32-byte Ed25519 seed as 64 hex characters.
+//! * The client plus the embedded delegates (Wasm + key + parameters) and
+//!   contracts (Wasm + code hash) become the archive file `freenet.js`, which
+//!   pages load with `<script src="freenet.js"></script>`.
+//! * A delegate's parameters are the web app's contract id, so that it can
+//!   check `d.origin` (`Delegate.requireApp`). The id is
+//!   BLAKE3(BLAKE3(web container code) ‖ public key): it does not depend on
+//!   the site, so it stays the same across releases.
+//! * The files are packed into `web.tar.xz`, signed with the key as release
+//!   `--version` (default: the current Unix time) and stored as the state.
+//!   Parameters = the public key (what the built-in web container expects).
 //!
-//! Writes to <dir>: state.bin, params.bin, web.tar.xz, site.txt
+//! Writes to <dir>: web_container.wasm, state.bin, params.bin, web.tar.xz, site.txt
 
 const std = @import("std");
 const Io = std.Io;
+const builtin = @import("builtin");
+const Ed25519 = std.crypto.sign.Ed25519;
 const freenet = @import("freenet");
 
-const script_tag = "<script src=\"freenet.js\"></script>";
+const client_name = "freenet.js";
 const max_file = 64 * 1024 * 1024;
 
 const Named = struct { name: []const u8, path: []const u8 };
@@ -27,8 +42,9 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
-
     var contract_path: ?[]const u8 = null;
+    var key_path: ?[]const u8 = null;
+    var version: ?u32 = null;
     var client_path: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var files: std.ArrayList(Named) = .empty;
@@ -47,6 +63,11 @@ pub fn main(init: std.process.Init) !void {
             client_path = value;
         } else if (std.mem.eql(u8, arg, "--out-dir")) {
             out_dir = value;
+        } else if (std.mem.eql(u8, arg, "--key")) {
+            key_path = value;
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            version = std.fmt.parseInt(u32, value, 10) catch return usage("--version must be a whole number above 0, got {s}", .{value});
+            if (version.? == 0) return usage("--version must be above 0", .{});
         } else if (std.mem.eql(u8, arg, "--file")) {
             try files.append(arena, try splitNamed(value));
         } else if (std.mem.eql(u8, arg, "--delegate")) {
@@ -55,8 +76,8 @@ pub fn main(init: std.process.Init) !void {
             try contracts.append(arena, try splitNamed(value));
         } else return usage("unknown option {s}", .{arg});
     }
-    if (contract_path == null or client_path == null or out_dir == null)
-        return usage("--web-contract, --client and --out-dir are required", .{});
+    if (contract_path == null or client_path == null or out_dir == null or key_path == null)
+        return usage("--web-contract, --client, --key and --out-dir are required", .{});
 
     const cwd = Io.Dir.cwd();
     const read = struct {
@@ -68,87 +89,146 @@ pub fn main(init: std.process.Init) !void {
         }
     }.f;
 
-    // Delegates: Wasm + keys, rendered as a JS object for the client.
-    var embedded: Io.Writer.Allocating = .init(arena);
-    const ew = &embedded.writer;
-    try ew.writeAll("FreenetClient.embedded = {");
-    var delegate_lines: Io.Writer.Allocating = .init(arena);
+    // The signing key, and the web app's id (see the module comment).
+    const key_pair = try readKey(io, arena, init.environ_map, key_path.?);
+    const public_key = key_pair.public_key.toBytes();
+    const contract_wasm = try read(io, arena, contract_path.?);
+    const app_id = freenet.types.contractInstanceId(contract_wasm, &public_key);
+
+    // freenet.js = the client + the embedded delegates and contracts.
+    var client_js: Io.Writer.Allocating = .init(arena);
+    const cw = &client_js.writer;
+    try cw.writeAll(try read(io, arena, client_path.?));
+    var key_lines: Io.Writer.Allocating = .init(arena);
+    try cw.writeAll("\nFreenetClient.embedded = {");
     for (delegates.items, 0..) |d, n| {
         const wasm = try read(io, arena, d.path);
-        const key = freenet.types.delegateKey(wasm, "");
-        const b64 = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(wasm.len));
-        _ = std.base64.standard.Encoder.encode(b64, wasm);
-        try ew.print("{s}\n  \"{s}\": {{ wasm: \"{s}\", key: \"{s}\", codeHash: \"{s}\" }}", .{
-            if (n == 0) "" else ",",              d.name,                                     b64,
-            &std.fmt.bytesToHex(key.key, .lower), &std.fmt.bytesToHex(key.code_hash, .lower),
+        const key = freenet.types.delegateKey(wasm, &app_id);
+        try cw.print("{s}\n  \"{s}\": {{ wasm: \"{s}\", key: \"{s}\", codeHash: \"{s}\", parameters: \"{s}\" }}", .{
+            if (n == 0) "" else ",",              d.name,                                           try base64(arena, wasm),
+            &std.fmt.bytesToHex(key.key, .lower), &std.fmt.bytesToHex(key.code_hash, .lower), &std.fmt.bytesToHex(app_id, .lower),
         });
         var b58: [64]u8 = undefined;
-        try delegate_lines.writer.print("delegate {s}: {s}\n", .{ d.name, freenet.types.encodeBase58(&b58, &key.key) });
+        try key_lines.writer.print("delegate {s}: {s}\n", .{ d.name, freenet.types.encodeBase58(&b58, &key.key) });
     }
-    try ew.writeAll("\n};\nFreenetClient.contracts = {");
+    try cw.writeAll("\n};\nFreenetClient.contracts = {");
     for (contracts.items, 0..) |c, n| {
         const wasm = try read(io, arena, c.path);
-        const b64 = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(wasm.len));
-        _ = std.base64.standard.Encoder.encode(b64, wasm);
-        try ew.print("{s}\n  \"{s}\": {{ wasm: \"{s}\", codeHash: \"{s}\" }}", .{
-            if (n == 0) "" else ",", c.name, b64, &std.fmt.bytesToHex(freenet.types.codeHash(wasm), .lower),
+        const code_hash = freenet.types.codeHash(wasm);
+        try cw.print("{s}\n  \"{s}\": {{ wasm: \"{s}\", codeHash: \"{s}\" }}", .{
+            if (n == 0) "" else ",", c.name, try base64(arena, wasm), &std.fmt.bytesToHex(code_hash, .lower),
         });
         var b58: [64]u8 = undefined;
-        try delegate_lines.writer.print("contract code {s}: {s}\n", .{ c.name, freenet.types.encodeBase58(&b58, &freenet.types.codeHash(wasm)) });
+        try key_lines.writer.print("contract code {s}: {s}\n", .{ c.name, freenet.types.encodeBase58(&b58, &code_hash) });
     }
-    try ew.writeAll("\n};\n");
+    try cw.writeAll("\n};\n");
 
-    const client = try read(io, arena, client_path.?);
-    if (std.mem.indexOf(u8, client, "</script") != null) return usage("client script must not contain </script", .{});
-    const inline_script = try std.mem.concat(arena, u8, &.{ "<script>\n", client, "\n", embedded.written(), "</script>" });
-
-    // Files, with the client inlined into HTML pages.
+    // The archive: the given files plus freenet.js.
     var packed_files: std.ArrayList(freenet.webapp.File) = .empty;
     var has_index = false;
-    var inlined: usize = 0;
+    var loads_client = false;
     for (files.items) |f| {
-        var data: []const u8 = try read(io, arena, f.path);
-        if (std.mem.endsWith(u8, f.name, ".html")) {
-            const count = std.mem.count(u8, data, script_tag);
-            if (count > 0) data = try std.mem.replaceOwned(u8, arena, data, script_tag, inline_script);
-            inlined += count;
-        }
+        if (std.mem.eql(u8, f.name, client_name))
+            return usage("{s} is generated; don't pass a file with that name", .{client_name});
+        const data = try read(io, arena, f.path);
+        if (std.mem.endsWith(u8, f.name, ".html"))
+            loads_client = loads_client or std.mem.indexOf(u8, data, client_name) != null;
         has_index = has_index or std.mem.eql(u8, f.name, "index.html");
         try packed_files.append(arena, .{ .name = f.name, .data = data });
     }
     if (!has_index) return usage("the web app needs a file named index.html", .{});
-    if (delegates.items.len + contracts.items.len > 0 and inlined == 0)
-        return usage("delegates/contracts were given but no .html file contains {s}", .{script_tag});
+    if (delegates.items.len + contracts.items.len > 0 and !loads_client)
+        return usage("delegates/contracts were given but no .html file loads {s}", .{client_name});
+    try packed_files.append(arena, .{ .name = client_name, .data = client_js.written() });
 
     const archive = try freenet.webapp.xzStore(arena, try freenet.webapp.tar(arena, packed_files.items));
-    const state = try freenet.webapp.buildState(arena, "", archive);
-    const params = freenet.types.blake3(&.{state});
-    const contract_wasm = try read(io, arena, contract_path.?);
+    const release = version orelse try unixTime(io);
+    const state = try freenet.webapp.signState(arena, key_pair, release, archive);
+    if (state.len > freenet.webapp.max_state_size)
+        return usage("the site is {d} bytes; the node stores at most {d} (archives are not compressed)", .{ state.len, freenet.webapp.max_state_size });
     var b58: [64]u8 = undefined;
-    const key = freenet.types.encodeBase58(&b58, &freenet.types.contractInstanceId(contract_wasm, &params));
+    const key = freenet.types.encodeBase58(&b58, &app_id);
 
     try cwd.createDirPath(io, out_dir.?);
     var dir = try cwd.openDir(io, out_dir.?, .{});
     defer dir.close(io);
+    try dir.writeFile(io, .{ .sub_path = "web_container.wasm", .data = contract_wasm });
     try dir.writeFile(io, .{ .sub_path = "state.bin", .data = state });
-    try dir.writeFile(io, .{ .sub_path = "params.bin", .data = &params });
+    try dir.writeFile(io, .{ .sub_path = "params.bin", .data = &public_key });
     try dir.writeFile(io, .{ .sub_path = "web.tar.xz", .data = archive });
     try dir.writeFile(io, .{ .sub_path = "site.txt", .data = try arena.print(
         \\contract key: {s}
         \\local URL:    http://127.0.0.1:7509/v1/contract/web/{s}/
+        \\release:      {d}
         \\state size:   {d} bytes
         \\{s}
-    , .{ key, key, state.len, delegate_lines.written() }) });
+    , .{ key, key, release, state.len, key_lines.written() }) });
 }
 
+/// Where `fdev website init` keeps key `name`: `dirs::config_dir()` +
+/// `freenet/website-keys/<name>.toml`.
+fn keyFilePath(arena: std.mem.Allocator, env: anytype, name: []const u8) ![]const u8 {
+    const home = env.get("HOME") orelse "";
+    const dir = switch (builtin.os.tag) {
+        .macos => try arena.print("{s}/Library/Application Support", .{home}),
+        .windows => env.get("APPDATA") orelse return fail("APPDATA is not set, so the signing key {s} can't be found; pass a file path", .{name}),
+        else => if (env.get("XDG_CONFIG_HOME")) |xdg| xdg else try arena.print("{s}/.config", .{home}),
+    };
+    return arena.print("{s}/freenet/website-keys/{s}.toml", .{ dir, name });
+}
+
+/// The key `name` (see the module comment), as an `fdev website init` file
+/// (`signing_key = "<hex>"`) or the 32-byte seed as 64 hex characters.
+fn readKey(io: Io, arena: std.mem.Allocator, env: anytype, name: []const u8) !Ed25519.KeyPair {
+    const is_path = std.mem.indexOfAny(u8, name, "/\\") != null or std.mem.endsWith(u8, name, ".toml") or std.mem.endsWith(u8, name, ".key");
+    const path = if (is_path) name else try keyFilePath(arena, env, name);
+    const text = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4096)) catch |err| {
+        std.debug.print("freenet-pack: cannot read the signing key {s} ({s}): {t}. Create it with `fdev website init {s}`.\n", .{ name, path, err, name });
+        return err;
+    };
+    var seed: [Ed25519.KeyPair.seed_length]u8 = undefined;
+    const hex = if (std.mem.indexOf(u8, text, "signing_key")) |at| quoted: {
+        const open = std.mem.indexOfScalarPos(u8, text, at, '"') orelse return fail("{s}: signing_key has no value", .{path});
+        const close = std.mem.indexOfScalarPos(u8, text, open + 1, '"') orelse return fail("{s}: signing_key has no value", .{path});
+        break :quoted text[open + 1 .. close];
+    } else std.mem.trim(u8, text, " \t\r\n");
+    if (hex.len != seed.len * 2) return fail("{s} is not a signing key (expected 64 hex characters)", .{path});
+    _ = std.fmt.hexToBytes(&seed, hex) catch return fail("{s} is not a signing key (expected 64 hex characters)", .{path});
+    return Ed25519.KeyPair.generateDeterministic(seed) catch return fail("{s} is not a usable signing key", .{path});
+}
+
+fn fail(comptime fmt: []const u8, args: anytype) error{InvalidKey} {
+    std.debug.print("freenet-pack: " ++ fmt ++ "\n", args);
+    return error.InvalidKey;
+}
+
+/// Seconds since the Unix epoch: the default release number, which grows with
+/// every build (the container only accepts a higher number than the current one).
+fn unixTime(io: Io) !u32 {
+    const now = Io.Clock.real.now(io);
+    return std.math.cast(u32, now.toSeconds()) orelse return fail("the system clock is out of range; pass --version", .{});
+}
+
+fn base64(gpa: std.mem.Allocator, data: []const u8) ![]const u8 {
+    const out = try gpa.alloc(u8, std.base64.standard.Encoder.calcSize(data.len));
+    return std.base64.standard.Encoder.encode(out, data);
+}
+
+/// `name=path`. The name is an archive path (or a delegate/contract name):
+/// `/`-separated segments of letters, digits, `_`, `-` and `.`, with no empty,
+/// `.` or `..` segments.
 fn splitNamed(value: []const u8) !Named {
     const eq = std.mem.indexOfScalar(u8, value, '=') orelse return usage("expected name=path, got {s}", .{value});
     const name = value[0..eq];
-    if (name.len == 0) return usage("empty name in {s}", .{value});
     for (name) |ch| switch (ch) {
         'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '.', '/' => {},
         else => return usage("unsupported character in name {s}", .{name}),
     };
+    var segments = std.mem.splitScalar(u8, name, '/');
+    while (segments.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, ".."))
+            return usage("name {s} must be a relative path without empty, . or .. parts", .{name});
+    }
     return .{ .name = name, .path = value[eq + 1 ..] };
 }
 
@@ -156,6 +236,7 @@ fn usage(comptime fmt: []const u8, args: anytype) error{InvalidArgs} {
     std.debug.print("freenet-pack: " ++ fmt ++ "\n", args);
     std.debug.print(
         \\usage: freenet-pack --web-contract <wasm> --client <freenet.js> --out-dir <dir>
+        \\                    --key <key file> [--version <n>]
         \\                    --file index.html=<path> [--file <name>=<path>]...
         \\                    [--delegate <name>=<wasm>]... [--embed-contract <name>=<wasm>]...
         \\

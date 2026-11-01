@@ -48,8 +48,10 @@ pub const ApplicationMessage = struct {
 
 `payload` is whatever the page sent: text, JSON, or your own binary format.
 `unsupported` covers the node's other message kinds (contract responses,
-notifications, lifecycle events) that the library doesn't decode yet. Handle it
-with `=> {}` or `=> return`, and the node gets an empty reply.
+notifications) that the library doesn't decode yet. Handle it with `=> {}` or
+`=> return`, and the node gets an empty reply. (Lifecycle and wake-up events
+are sent only to delegates that declare them in a manifest, which this library
+can't emit yet, so they never arrive.)
 
 ## Replying
 
@@ -67,23 +69,43 @@ can reply zero, one or several times; the page receives all of them, in order.
 switch (d.origin) {
     .web_app => |contract_id| {}, // the web app's contract instance id
     .delegate => |key| {},        // another delegate (key + code hash)
-    .none => {},                  // e.g. lifecycle events
+    .none => {},                  // no origin given
     .unknown => |tag| {},
 }
 ```
 
-The node attests the origin, so you can trust it. For example, compare
-`contract_id` with your own app's id so that only your page can use a signing
-delegate.
+The node attests the origin, so you can trust it.
+
+**Any site on the user's node can message your delegate.** Its key is printed in
+`site.txt` and embedded in your page, so another web app can register it and
+send it anything. So check where a message comes from before you do anything
+sensitive, such as signing or revealing a secret:
+
+```zig
+try d.requireApp();   // fails the call unless the message is from this delegate's own web app
+```
+
+This works because `freenet-pack` sets each embedded delegate's
+`d.parameters` to its web app's contract id (32 bytes), and the node attests
+the sender's id in `d.origin`. `requireApp` compares the two, and fails closed:
+no parameters, another site, another delegate or no origin are all refused.
+Another site can register your delegate's code with its own parameters, but
+then it is a different delegate (the key includes the parameters) with its own,
+empty secrets.
+
+Delegates not built through `addWebApp` have no app id; check `d.origin`
+yourself.
 
 ## Errors
 
 Any error returned from `handle` fails the call. The app receives
-`DelegateError::Other(message)`, and `freenet.js` throws it as an `Error`:
+`DelegateError::Other(message)`, and `freenet.js` throws a
+`FreenetClient.Error` whose `message` is that message:
 
 - `return d.fail("insufficient balance")` sends that message.
 - Any other error (`return error.Overflow`) sends its name, `"Overflow"`.
-- Malformed input never reaches `handle`; the app gets `"EndOfStream"` or similar.
+- Malformed input never reaches `handle`; the app gets
+  `DelegateError::Deser("EndOfStream")` or similar.
 
 ## Randomness
 
@@ -113,8 +135,12 @@ const keys = try s.list("room:");            // keys with this prefix
 ```
 
 Secrets are tied to the delegate's key, which is a hash of its Wasm code. **A
-rebuilt delegate is a new delegate and can't see the old one's secrets.** Plan
-releases accordingly, for example by keeping the delegate's code stable.
+rebuilt delegate is a new delegate and can't see the old one's secrets.** That
+includes rebuilding the same source with another Zig version or optimize mode.
+Plan releases accordingly, for example by keeping the delegate's code stable.
+
+Two apps that embed the same delegate binary share one delegate, and so one
+set of secrets.
 
 ## Context
 
@@ -122,8 +148,11 @@ Scratch state that lives for one batch of messages, not across calls:
 
 ```zig
 const ctx = try d.context(); // read
-try d.setContext("step-2");  // replace (emits ContextUpdated)
+try d.setContext("step-2");  // replace
 ```
+
+Both go through the node's context functions, so in tests `freenet.testing`
+sees the same context (`t.context()`).
 
 ## Allocation
 
@@ -142,8 +171,8 @@ Output appears in the node's log.
 ## Parameters
 
 `d.parameters` holds the delegate's parameters, which are part of its key.
-Delegates built with `addDelegate` and embedded with `addWebApp` have empty
-parameters.
+Delegates embedded with `addWebApp` get their web app's contract id (32
+bytes) as parameters; see [Origin](#origin-whos-asking).
 
 ## Limits and notes
 

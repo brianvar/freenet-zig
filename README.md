@@ -66,7 +66,11 @@ const freenet = @import("freenet");
 pub fn build(b: *std.Build) void {
     const dep = b.dependencyFromBuildZig(freenet, .{});
     const random = freenet.addDelegate(b, dep, .{ .name = "random", .root_source_file = b.path("src/delegate.zig") });
-    const app = freenet.addWebApp(b, dep, .{ .page = b.path("web/index.html"), .delegates = &.{random} });
+    const app = freenet.addWebApp(b, dep, .{
+        .page = b.path("web/index.html"),
+        .signing_key = "my-app", // the key made by `fdev website init my-app`
+        .delegates = &.{random},
+    });
     b.getInstallStep().dependOn(app.install);
 }
 ```
@@ -74,8 +78,9 @@ pub fn build(b: *std.Build) void {
 Then:
 
 ```sh
+fdev website init my-app   # once: your signing key (keep it private)
 zig build
-fdev publish --code zig-out/bin/web_container.wasm --parameters zig-out/site/params.bin \
+fdev publish --code zig-out/site/web_container.wasm --parameters zig-out/site/params.bin \
   contract --state zig-out/site/state.bin
 cat zig-out/site/site.txt     # the URL to open
 ```
@@ -93,7 +98,8 @@ await counter.update(`${me}:${clicks}\n`);            // merged by the contract'
 Examples:
 
 - [examples/counter](examples/counter): a shared counter. A contract with a
-  commutative merge, plus a page that uses the contract API.
+  commutative merge, a delegate that keeps each visitor's id, and a page that
+  uses both.
 - [freenet-zig-random](../freenet-zig-random): a page plus a delegate that
   generates random numbers.
 
@@ -126,8 +132,12 @@ The wire formats follow freenet-stdlib and freenet-core as of October 2026.
 - **Run on a live node:** page-to-delegate messaging, randomness and the web
   container, in the app this library was extracted from, using the same formats.
 - **Not yet run on a live node:**
+  - Loading `freenet.js` as a separate file in the site archive (it used to be
+    inlined into the page). freenet-core serves archive files to the sandboxed
+    page the same way it serves any script, so this is expected to work.
   - The contract API in `freenet.js` has been tested against a mock node
-    running real contract Wasm.
+    running real contract Wasm. The client's connection handling has Node
+    tests: open `js/test.html` in a browser.
   - Secrets, context, logging and custom contracts are tested byte by byte
     against the Rust type definitions.
 

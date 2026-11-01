@@ -20,12 +20,13 @@ Sources of truth:
 | `src/contract.zig` | contract types, wire codecs, `exportContract` |
 | `src/host.zig` | node imports (random, log, context, secrets) and their native stand-ins |
 | `src/types.zig` | ids, key derivation (BLAKE3), base58 |
-| `src/webapp.zig` | web-app state layout, tar, stored xz |
-| `src/webcontainer.zig` | the built-in content-addressed web contract |
-| `src/testing.zig` | the native harness |
+| `src/webapp.zig` | web-app state layout, tar, stored xz, signed-site metadata (CBOR) and verification |
+| `src/webcontainer.zig` | the built-in signed web contract |
+| `src/testing.zig` | the native harness (and the codecs only tests need) |
 | `src/tests.zig` | byte-exact wire-format tests |
 | `tools/` | `freenet-pack`, `freenet-check-wasm` |
 | `js/freenet.js` | browser client |
+| `js/test.html` | browser tests for the client (open the file; fake WebSocket) |
 
 ## The Wasm ABI
 
@@ -108,8 +109,10 @@ append-only: 1 UserResponse, 2-6 contract responses/notifications,
 1 `Delegate(DelegateKey { key: [u8;32], code_hash: [u8;32] })`.
 
 **Delegate result:** `Result<Vec<OutboundDelegateMsg>, DelegateError>`.
-Outbound 0 is `ApplicationMessage` (sent with `processed: true`), 2 is
-`ContextUpdated(Bytes)`. `DelegateError` is 0 `Deser(String)`, 1 `Other(String)`.
+The library emits only outbound 0, `ApplicationMessage` (sent with
+`processed: true`); `setContext` uses the `ctx_write` host function rather
+than outbound 2, `ContextUpdated`, which freenet-stdlib marks for removal.
+`DelegateError` is 0 `Deser(String)` (malformed input), 1 `Other(String)`.
 
 **Contract inputs:**
 
@@ -162,15 +165,23 @@ How the client handles responses:
 - **Matching replies.** Replies carry no request id, so the client sends one
   request at a time. A response is matched to the waiting request by kind and
   key, so unsolicited extras, such as a `SubscribeResponse` after a subscribing
-  `Get`, are ignored.
+  `Get`, are ignored. An error can't be matched, so it goes to the request in
+  flight. A request that times out may still be answered later, so a timeout
+  closes the connection (and reconnects, if enabled) instead of sending the
+  next request on the same one.
 - **Notifications** (`UpdateNotification`) go to subscribers.
 - **Large responses.** Responses over 512 KiB arrive as `StreamChunk`s of the
   serialized response, optionally preceded by a `StreamHeader`; the client
   concatenates the chunks and parses the result. Requests up to 100 MB are
   accepted unchunked.
 - **Contract ids in the browser.** `freenet.js` includes BLAKE3 (checked against
-  Zig's `std.crypto.hash.Blake3` across chunk and tree boundaries) to derive
-  instance ids from code hash and parameters.
+  the official BLAKE3 test vectors across chunk and tree boundaries, in
+  `js/test.html`) to derive instance ids from code hash and parameters.
+- **The sandbox.** freenet-core serves pages in an iframe without
+  `allow-same-origin` and injects a WebSocket shim before `</head>` that
+  routes the socket through the shell page, which adds the auth token the
+  node uses to attest `MessageOrigin::WebApp`. The client only touches
+  `WebSocket` when `connect()` runs, so it works wherever the script tag is.
 
 ## Keys
 
@@ -193,12 +204,21 @@ expectations are updated.
 
 - **Run on a live node (freenet-core, October 2026), in the app this library
   was extracted from, with the same wire formats:** delegate registration and
-  messaging from a page, randomness, the web container, and publishing with
-  `fdev`.
+  messaging from a page, randomness, the (earlier, content-addressed) web
+  container, and publishing with `fdev`.
 - **Tested byte by byte, not yet on a live node:** secrets, context, logging,
   custom contracts, related contracts, and the error mappings.
 - **Tested against a mock node, not yet on a live node:** the `freenet.js`
   contract API (put, get, update, subscribe, notifications, chunked responses).
   The mock runs real contract Wasm and checks ids independently.
+- **Checked against freenet-core's own website contract** (run in Node, with
+  the node's streaming buffer protocol): the signed state this library writes
+  (metadata bytes, signature, version rule, sync summary) is accepted by it,
+  and the library accepts states in `fdev website`'s encoding. The vectors are
+  in `src/webapp.zig`.
+- **Not yet run on a live node:** the signed web container built in Zig,
+  `freenet.js` loaded as its own archive file (it used to be inlined into each
+  page), delegates with the app id as parameters, and the `visitor` delegate
+  of `examples/counter`.
 
 Reports of what works and what doesn't on real nodes are welcome.

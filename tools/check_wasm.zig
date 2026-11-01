@@ -1,13 +1,15 @@
 //! freenet-check-wasm: verifies compiled modules against the Freenet ABI.
-//! Normally run through `addWasmCheck` / `addTests` in build.zig.
+//! Normally run through `addTests` in build.zig.
 //!
 //!   freenet-check-wasm --delegate <file.wasm> ... --contract <file.wasm> ...
 //!
 //! * exports must be exactly the ABI for the kind (plus `memory`)
 //! * imports must come from what the node provides for that kind
+//! * contracts must not import randomness (they must be deterministic)
 //!
 //! Catches mistakes that would otherwise only show as a load failure on the
-//! node: a missing export, a leaked toolchain export, an unknown import.
+//! node, or as peers disagreeing: a missing export, a leaked toolchain
+//! export, an unknown import, a contract calling `freenet.random`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -16,12 +18,16 @@ const freenet = @import("freenet");
 const Kind = enum { delegate, contract };
 
 const common_imports = [_][]const u8{
-    "freenet_rand.__frnt__rand__rand_bytes",
     "freenet_log.__frnt__logger__info",
     "freenet_time.__frnt__time__utc_now",
 };
 
+/// The node provides randomness to contracts too, but every peer must compute
+/// the same result, so a contract that uses it is a bug.
+const rand_import = "freenet_rand.__frnt__rand__rand_bytes";
+
 const delegate_only_imports = [_][]const u8{
+    rand_import,
     "freenet_delegate_ctx.__frnt__delegate__ctx_len",
     "freenet_delegate_ctx.__frnt__delegate__ctx_read",
     "freenet_delegate_ctx.__frnt__delegate__ctx_write",
@@ -82,6 +88,11 @@ fn check(arena: std.mem.Allocator, path: []const u8, kind: Kind, bytes: []const 
     }
 
     for (found.imports) |imp| {
+        if (kind == .contract and std.mem.eql(u8, imp, rand_import)) {
+            std.debug.print("{s}: contracts must be deterministic, but this one uses freenet.random (randomness belongs in delegates)\n", .{path});
+            ok = false;
+            continue;
+        }
         const allowed = contains(&common_imports, imp) or (kind == .delegate and contains(&delegate_only_imports, imp));
         if (!allowed) {
             std.debug.print("{s}: import {s} is not provided to a {t} by the node\n", .{ path, imp, kind });

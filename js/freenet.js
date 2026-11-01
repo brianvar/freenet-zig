@@ -1,8 +1,8 @@
 // freenet.js: minimal browser client for Freenet web apps (no dependencies).
 //
 // In your page, load it with a script tag whose src is "freenet.js".
-// `freenet-pack` replaces that exact tag with this file plus your embedded
-// delegates and contracts, so the published page is one self-contained file.
+// `freenet-pack` writes this file, plus the table of your embedded delegates
+// and contracts, into the site archive as `freenet.js`.
 //
 //   const client = await FreenetClient.connect();
 //
@@ -17,18 +17,24 @@
 //   await room.update(delta);
 //
 // Speaks the node's WebSocket API with ?encodingProtocol=native (bincode).
+// Only `FreenetClient` is added to the page's globals. `FreenetClient.Error`
+// is the error class for refusals from the node, and `FreenetClient.util` has
+// the helpers pages need to work with ids: blake3, base58Encode, base58Decode,
+// hexToBytes, bytesToHex, concatBytes.
+(() => {
 "use strict";
 
 class FreenetClient {
-  /** Filled in by freenet-pack: { name: { wasm: base64, key: hex, codeHash: hex } } */
+  /** Filled in by freenet-pack: { name: { wasm: base64, key: hex, codeHash: hex, parameters: hex } } */
   static embedded = {};
   /** Filled in by freenet-pack: { name: { wasm: base64, codeHash: hex } } */
   static contracts = {};
 
   /**
    * Connect to the local node (the page's own host when served by Freenet).
-   * Options: url, reconnect (default true), onStatus(status) with status one
-   * of "connecting" | "open" | "closed".
+   * Options: url, reconnect (default true: after the connection is lost, or
+   * after a request times out, reconnect every 2 s), onStatus(status) with
+   * status one of "connecting" | "open" | "closed".
    */
   static connect(options = {}) {
     const client = new FreenetClient(options);
@@ -39,11 +45,13 @@ class FreenetClient {
     this.url = url ?? FreenetClient.defaultUrl();
     this.reconnect = reconnect;
     this.onStatus = onStatus;
-    this._pending = [];              // requests awaiting an answer (at most one)
+    this._inflight = null;           // the request awaiting an answer (one at a time)
     this._queue = Promise.resolve(); // serializes requests
-    this._registered = new Map();    // delegate name -> handle (re-registered on reconnect)
+    this._registered = new Map();    // delegate name -> Promise<DelegateHandle>
     this._listeners = new Map();     // contract id hex -> Set of callbacks
+    this._subscribed = new Map();    // contract id hex -> Promise (subscription on this connection)
     this._streams = new Map();       // stream id -> chunks of a large response
+    this._everOpened = false;
     this._closing = false;
   }
 
@@ -55,16 +63,20 @@ class FreenetClient {
   // ---- delegates ----
 
   /** Register an embedded delegate (once) and return a handle to message it. */
-  async delegate(name) {
-    if (this._registered.has(name)) return this._registered.get(name);
-    const spec = FreenetClient.embedded[name];
-    if (!spec) throw new Error(`no embedded delegate named "${name}" (check addWebApp's delegates)`);
-    const handle = new DelegateHandle(this, name, {
-      wasm: b64ToBytes(spec.wasm), key: hexToBytes(spec.key), codeHash: hexToBytes(spec.codeHash),
-    });
-    await this._register(handle);
-    this._registered.set(name, handle);
-    return handle;
+  delegate(name) {
+    let pending = this._registered.get(name);
+    if (!pending) {
+      const spec = FreenetClient.embedded[name];
+      if (!spec) return Promise.reject(new Error(`no embedded delegate named "${name}" (check addWebApp's delegates)`));
+      const handle = new DelegateHandle(this, name, {
+        wasm: b64ToBytes(spec.wasm), key: hexToBytes(spec.key), codeHash: hexToBytes(spec.codeHash),
+        parameters: hexToBytes(spec.parameters ?? ""), // the web app's id, see Delegate.requireApp
+      });
+      pending = this._register(handle).then(() => handle);
+      this._registered.set(name, pending);
+      pending.catch(() => this._registered.delete(name)); // allow a retry
+    }
+    return pending;
   }
 
   // ---- contracts ----
@@ -89,9 +101,8 @@ class FreenetClient {
    */
   contractAt(id, codeHash) {
     return new ContractHandle(this, {
-      id: typeof id === "string" ? base58Decode(id) : id,
-      codeHash: codeHash == null ? null : typeof codeHash === "string"
-        ? (/^[0-9a-f]{64}$/i.test(codeHash) ? hexToBytes(codeHash) : base58Decode(codeHash)) : codeHash,
+      id: bytes32(id, "contract id"),
+      codeHash: codeHash == null ? null : bytes32(codeHash, "code hash"),
     });
   }
 
@@ -111,30 +122,45 @@ class FreenetClient {
       let opened = false;
       ws.onopen = async () => {
         opened = true;
-        try {
-          for (const handle of this._registered.values()) await this._register(handle);
-          for (const [idHex, entry] of this._listeners) {
-            if (entry.size > 0) await this._subscribe(hexToBytes(idHex));
-          }
-          this.onStatus("open");
-          resolve();
-        } catch (err) { reject(err); }
+        this._everOpened = true;
+        // After a reconnect: register delegates and renew subscriptions again.
+        // A failure is logged, not fatal; if the connection drops meanwhile,
+        // onclose takes over.
+        for (const pending of [...this._registered.values()]) {
+          const handle = await pending.catch(() => null);
+          if (handle) await this._register(handle).catch((err) => console.warn("freenet.js:", err.message));
+        }
+        for (const [idHex, set] of this._listeners) {
+          if (set.size > 0) await this._ensureSubscribed(hexToBytes(idHex), idHex).catch((err) => console.warn("freenet.js:", err.message));
+        }
+        if (this.ws !== ws) return reject(new Error("connection closed"));
+        this.onStatus("open");
+        resolve();
       };
-      ws.onmessage = (event) => this._onMessage(event.data);
+      ws.onmessage = (event) => {
+        // Ignore a socket we already gave up on (e.g. after a timeout).
+        if (this.ws === ws && ws.readyState === WebSocket.OPEN) this._handle(new Uint8Array(event.data));
+      };
       ws.onclose = () => {
-        this._pending.forEach((p) => { clearTimeout(p.timer); p.reject(new Error("connection closed")); });
-        this._pending = [];
+        if (this.ws !== ws) return;
+        this.ws = null;
+        if (this._inflight) {
+          const entry = this._inflight;
+          this._inflight = null;
+          clearTimeout(entry.timer);
+          entry.reject(new Error("connection closed"));
+        }
         this._streams.clear();
+        this._subscribed.clear();
         this.onStatus("closed");
         if (!opened) reject(new Error(`cannot connect to ${this.url}`));
-        if (this.reconnect && !this._closing) setTimeout(() => this._open().catch(() => {}), 2000);
+        // Only a client that connected once reconnects; a failed first
+        // connect just rejects `connect()`.
+        if (this._everOpened && this.reconnect && !this._closing) {
+          setTimeout(() => this._open().catch(() => {}), 2000);
+        }
       };
     });
-  }
-
-  async _onMessage(data) {
-    if (data instanceof Blob) data = await data.arrayBuffer();
-    this._handle(new Uint8Array(data));
   }
 
   _handle(bytes) {
@@ -149,10 +175,13 @@ class FreenetClient {
         return;
       }
     }
-    const entry = this._pending[0];
+    const entry = this._inflight;
     if (!entry) return;
-    if (res.kind !== "error" && !entry.expects(res)) return; // unsolicited (e.g. an extra SubscribeResponse)
-    this._pending.shift();
+    // Replies carry no request id. An error can't be matched to a request,
+    // so it goes to the one in flight; other replies must look like the
+    // answer we expect (e.g. not an extra SubscribeResponse).
+    if (res.kind !== "error" && !entry.expects(res)) return;
+    this._inflight = null;
     clearTimeout(entry.timer);
     if (res.kind === "error") entry.reject(new FreenetError(res.error)); else entry.resolve(res);
   }
@@ -169,17 +198,23 @@ class FreenetClient {
   }
 
   // Requests go out one at a time: replies carry no request id, so the next
-  // request is sent only after the previous one was answered (or failed).
+  // request is sent only after the previous one was answered or failed. A
+  // timed-out request may still be answered later, which would then look
+  // like the answer to the next one, so a timeout drops the connection (and
+  // reconnects, if enabled) instead of carrying on.
   _request(bytes, expects, timeoutMs = 30000) {
     const run = () => new Promise((resolve, reject) => {
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return reject(new Error("not connected"));
+      const ws = this.ws;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return reject(new Error("not connected"));
       const entry = { resolve, reject, expects };
       entry.timer = setTimeout(() => {
-        this._pending = this._pending.filter((p) => p !== entry);
+        if (this._inflight !== entry) return;
+        this._inflight = null;
         reject(new Error("timed out waiting for the node"));
+        ws.close();
       }, timeoutMs);
-      this._pending.push(entry);
-      this.ws.send(bytes);
+      this._inflight = entry;
+      ws.send(bytes);
     });
     const result = this._queue.then(run, run);
     this._queue = result.catch(() => {});
@@ -202,17 +237,24 @@ class FreenetClient {
     try {
       await this._request(req, (r) => r.kind === "delegate" || r.kind === "ok");
     } catch (err) {
-      // A refusal (e.g. already registered) is not fatal; messages will tell.
-      if (!/timed out|not connected|closed/.test(err.message)) console.warn(`freenet.js: RegisterDelegate(${handle.name}):`, err.message);
-      else throw err;
+      // A refusal from the node (e.g. already registered) is not fatal;
+      // messages will tell. Connection problems are.
+      if (!(err instanceof FreenetError)) throw err;
+      console.warn(`freenet.js: RegisterDelegate(${handle.name}):`, err.message);
     }
   }
 
-  _subscribe(id, summary = null) {
-    // ClientRequest::ContractOp(ContractRequest::Subscribe { key, summary })
-    const w = new Writer().u32(1).u32(3).raw(id);
-    if (summary) w.u8(1).bytes(summary); else w.u8(0);
-    return this._request(w.finish(), (r) => r.kind === "subscribed" && equalBytes(r.key.id, id));
+  // One Subscribe per contract and connection, shared by concurrent callers.
+  _ensureSubscribed(id, idHex) {
+    let pending = this._subscribed.get(idHex);
+    if (!pending) {
+      // ClientRequest::ContractOp(ContractRequest::Subscribe { key, summary: None })
+      const req = new Writer().u32(1).u32(3).raw(id).u8(0).finish();
+      pending = this._request(req, (r) => r.kind === "subscribed" && equalBytes(r.key.id, id));
+      this._subscribed.set(idHex, pending);
+      pending.catch(() => { if (this._subscribed.get(idHex) === pending) this._subscribed.delete(idHex); });
+    }
+    return pending;
   }
 }
 
@@ -321,18 +363,17 @@ class ContractHandle {
 
   /**
    * Call `onUpdate({ state?, delta? })` (Uint8Arrays) whenever the contract
-   * changes. Resolves to a function that removes the callback. Subscriptions
-   * are renewed automatically after reconnects.
+   * changes. Resolves, once the node confirmed the subscription, to a
+   * function that removes the callback. Subscriptions are renewed after
+   * reconnects; changes made while disconnected are not replayed.
    */
   async subscribe(onUpdate) {
+    const c = this.client;
     const idHex = bytesToHex(this.id);
-    let set = this.client._listeners.get(idHex);
-    const first = !set || set.size === 0;
-    if (!set) this.client._listeners.set(idHex, set = new Set());
+    let set = c._listeners.get(idHex);
+    if (!set) c._listeners.set(idHex, set = new Set());
     set.add(onUpdate);
-    if (first) {
-      try { await this.client._subscribe(this.id); } catch (err) { set.delete(onUpdate); throw err; }
-    }
+    try { await c._ensureSubscribed(this.id, idHex); } catch (err) { set.delete(onUpdate); throw err; }
     return () => set.delete(onUpdate);
   }
 }
@@ -357,6 +398,7 @@ class Reader {
   u32() { this.need(4); const v = this.view.getUint32(this.pos, true); this.pos += 4; return v; }
   u64() { this.need(8); const v = this.view.getBigUint64(this.pos, true); this.pos += 8; return Number(v); }
   bytes() { return this.raw(this.u64()); }
+  text() { return bytesToText(this.bytes()); }
   contractKey() { return { id: this.raw(32).slice(), codeHash: this.raw(32).slice() }; }
 }
 
@@ -365,7 +407,7 @@ function parseHostResponse(buf) {
   const r = new Reader(buf);
   if (r.u32() !== 0) {
     let info;
-    try { info = parseClientError(r); } catch { info = { kind: "Unknown", message: "the node returned an error" }; }
+    try { info = parseClientError(r); } catch { info = { kind: "Unknown" }; }
     return { kind: "error", error: info };
   }
   switch (r.u32()) {
@@ -387,58 +429,54 @@ function parseHostResponse(buf) {
   }
 }
 
-/** ClientError { kind: ErrorKind } -> { kind: "MissingContract" | ..., message, contract?, cause? } */
+// ErrorKind variant names, by index.
+const ERROR_KINDS = ["ChannelClosed", "DeserializationError", "Disconnect", "IncorrectState", "NodeUnavailable",
+  "TransportProtocolDisconnect", "Unhandled", "UnknownClient", "RequestError", "OperationError", "FailedOperation",
+  "Shutdown", "EmptyRing", "PeerNotJoined"];
+
+/**
+ * ClientError { kind: ErrorKind } -> { kind, message, cause?, contract?, delegate? }.
+ * `kind` names the node's variant; ids are base58 as Freenet prints them.
+ */
 function parseClientError(r) {
-  const key = () => base58Encode(r.contractKey().id);      // ContractKey: shown by its instance id
-  const instance = () => base58Encode(r.raw(32));          // ContractInstanceId
+  const tag = r.u32();
+  let info = { kind: ERROR_KINDS[tag] ?? "Unknown" };
+  if (tag === 1 || tag === 6 || tag === 9) info.cause = r.text();         // { cause }
+  else if (tag === 3) info.contract = base58Encode(r.contractKey().id);  // IncorrectState(ContractKey)
+  else if (tag === 8) info = parseRequestError(r);
+  const subject = info.contract ?? info.delegate;
+  info.message = info.kind === "DelegateExecutionError" ? info.cause // the delegate's own message
+    : `${info.kind}${subject ? ` ${subject}` : ""}${info.cause ? `: ${info.cause}` : ""}`;
+  return info;
+}
+
+function parseRequestError(r) {
   const delegateKey = () => { const k = base58Encode(r.raw(32)); r.raw(32); return k; };
-  const str = () => bytesToText(r.bytes());
-  switch (r.u32()) {                                       // ErrorKind
-    case 0: return { kind: "ChannelClosed", message: "comm channel between client/host closed" };
-    case 1: { const cause = str(); return { kind: "DeserializationError", cause, message: `error while deserializing: ${cause}` }; }
-    case 2: return { kind: "Disconnect", message: "client disconnected" };
-    case 3: { const contract = key(); return { kind: "IncorrectState", contract, message: `failed while trying to unpack state for ${contract}` }; }
-    case 4: return { kind: "NodeUnavailable", message: "node not available" };
-    case 5: return { kind: "TransportProtocolDisconnect", message: "lost the connection with the protocol handling connections" };
-    case 6: { const cause = str(); return { kind: "Unhandled", cause, message: `unhandled error: ${cause}` }; }
-    case 7: return { kind: "UnknownClient", message: `unknown client id: ${r.u64()}` };
-    case 8: switch (r.u32()) {                             // RequestError
-      case 0: {                                            // ContractError
-        const v = r.u32();
-        if (v <= 3) {                                      // Get / Put / Update / Subscribe { key, cause }
-          const contract = key(), cause = str();
-          const [kind, what] = [["Get", "failed to get contract"], ["Put", "put error for contract"],
-            ["Update", "update error for contract"], ["Subscribe", "failed to subscribe for contract"]][v];
-          return { kind, contract, cause, message: `${what} ${contract}, reason: ${cause}` };
-        }
-        const contract = instance();
-        if (v === 4) return { kind: "ContractStackOverflow", contract, message: `dependency contract stack overflow: ${contract}` };
-        if (v === 5) return { kind: "MissingRelated", contract, message: `missing related contract: ${contract}` };
-        if (v === 6) return { kind: "MissingContract", contract, message: `missing contract: ${contract}` };
-        return { kind: "ContractError", message: "contract error" };
+  switch (r.u32()) {
+    case 0: { // ContractError
+      const v = r.u32();
+      if (v <= 3) { // Get / Put / Update / Subscribe { key: ContractKey, cause }
+        const contract = base58Encode(r.contractKey().id);
+        return { kind: ["Get", "Put", "Update", "Subscribe"][v], contract, cause: r.text() };
       }
-      case 1: switch (r.u32()) {                           // DelegateError
-        case 0: { const delegate = delegateKey(); return { kind: "RegisterError", delegate, message: `error while registering delegate ${delegate}` }; }
-        case 1: { const cause = str(); return { kind: "DelegateExecutionError", cause, message: cause }; }
-        case 2: { const delegate = delegateKey(); return { kind: "MissingDelegate", delegate, message: `missing delegate ${delegate}` }; }
-        case 3: { const delegate = delegateKey(); const secret = str(); r.raw(32); return { kind: "MissingSecret", delegate, message: `missing secret \`${secret}\` for delegate ${delegate}` }; }
-        case 4: return { kind: "ForbiddenSecretAccess", message: "forbidden access to secret" };
-        default: return { kind: "DelegateError", message: "delegate error" };
-      }
-      case 2: return { kind: "Disconnect", message: "client disconnect" };
-      case 3: return { kind: "Timeout", message: "operation timed out" };
-      default: return { kind: "RequestError", message: "request error" };
+      const kind = ["ContractStackOverflow", "MissingRelated", "MissingContract"][v - 4];
+      return kind ? { kind, contract: base58Encode(r.raw(32)) } : { kind: "ContractError" };
     }
-    case 9: { const cause = str(); return { kind: "OperationError", cause, message: `error while executing operation in the network: ${cause}` }; }
-    case 10: return { kind: "FailedOperation", message: "operation timed out" };
-    case 11: return { kind: "Shutdown", message: "peer should shutdown" };
-    case 12: return { kind: "EmptyRing", message: "no ring connections found" };
-    case 13: return { kind: "PeerNotJoined", message: "peer has not joined the network yet" };
-    default: return { kind: "Unknown", message: "the node returned an error" };
+    case 1: switch (r.u32()) { // DelegateError
+      case 0: return { kind: "RegisterError", delegate: delegateKey() };
+      case 1: return { kind: "DelegateExecutionError", cause: r.text() };
+      case 2: return { kind: "MissingDelegate", delegate: delegateKey() };
+      case 3: { const delegate = delegateKey(); return { kind: "MissingSecret", delegate, cause: r.text() }; }
+      case 4: return { kind: "ForbiddenSecretAccess" };
+      default: return { kind: "DelegateError" };
+    }
+    case 2: return { kind: "Disconnect" };
+    case 3: return { kind: "Timeout" };
+    default: return { kind: "RequestError" };
   }
 }
 
-/** Errors from the node: `err.kind` names the node's error variant. */
+/** Refusals from the node: `err.kind` names the node's error variant. */
 class FreenetError extends Error {
   constructor(info) {
     super(info.message);
@@ -482,10 +520,26 @@ function isNotFound(err, idString) {
 
 // ---- bytes, text, base58 ----
 
-function toBytes(v) { return typeof v === "string" ? new TextEncoder().encode(v) : v; }
+/** A string (UTF-8 encoded), Uint8Array, other typed array view or ArrayBuffer, as a Uint8Array. */
+function toBytes(v) {
+  if (typeof v === "string") return new TextEncoder().encode(v);
+  if (v instanceof Uint8Array) return v;
+  if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+  if (v instanceof ArrayBuffer) return new Uint8Array(v);
+  throw new TypeError(`expected a string, Uint8Array or ArrayBuffer, got ${Object.prototype.toString.call(v)}`);
+}
+/** A 32-byte id: base58 or 64-char hex string, or bytes. */
+function bytes32(v, what) {
+  const b = typeof v === "string" ? (/^[0-9a-f]{64}$/i.test(v) ? hexToBytes(v) : base58Decode(v)) : toBytes(v);
+  if (b.length !== 32) throw new TypeError(`${what} must be 32 bytes, got ${b.length}`);
+  return b;
+}
 function bytesToText(b) { return new TextDecoder().decode(b); }
 function b64ToBytes(s) { return Uint8Array.from(atob(s), (c) => c.charCodeAt(0)); }
-function hexToBytes(h) { return Uint8Array.from(h.match(/../g) ?? [], (b) => parseInt(b, 16)); }
+function hexToBytes(h) {
+  if (!/^(?:[0-9a-f]{2})*$/i.test(h)) throw new TypeError(`invalid hex: ${h}`);
+  return Uint8Array.from(h.match(/../g) ?? [], (b) => parseInt(b, 16));
+}
 function bytesToHex(b) { return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join(""); }
 function equalBytes(a, b) { return a.length === b.length && a.every((v, i) => v === b[i]); }
 function concatBytes(...parts) {
@@ -508,7 +562,7 @@ function base58Decode(s) {
   let n = 0n;
   for (const c of s) {
     const v = B58.indexOf(c);
-    if (v < 0) throw new Error(`invalid base58: ${s}`);
+    if (v < 0) throw new TypeError(`invalid base58: ${s}`);
     n = n * 58n + BigInt(v);
   }
   const out = [];
@@ -587,3 +641,8 @@ function blake3(data) {
   for (let i = 0; i < 32; i++) outBytes[i] = (root[i >> 2] >>> ((i & 3) * 8)) & 0xff;
   return outBytes;
 }
+
+FreenetClient.Error = FreenetError;
+FreenetClient.util = { blake3, base58Encode, base58Decode, hexToBytes, bytesToHex, concatBytes };
+globalThis.FreenetClient = FreenetClient;
+})();

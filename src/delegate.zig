@@ -54,14 +54,6 @@ pub const Inbound = union(enum) {
     unsupported: struct { tag: u32, raw: []const u8 },
 };
 
-/// An outbound message (`OutboundDelegateMsg`) the delegate emits.
-pub const Outbound = union(enum) {
-    /// Sent back to the app (`ApplicationMessage { processed: true }`).
-    application: []const u8,
-    /// Replaces the delegate context (`ContextUpdated`).
-    context_updated: []const u8,
-};
-
 /// Handed to your `handle` function for each message.
 pub const Delegate = struct {
     /// Allocator for this call. Everything is freed by the node when the call
@@ -72,12 +64,13 @@ pub const Delegate = struct {
     /// Who sent the message.
     origin: Origin,
 
-    outbox: std.ArrayList(Outbound) = .empty,
+    /// Reply payloads so far, sent to the app when `handle` returns.
+    replies: std.ArrayList([]const u8) = .empty,
     failure: ?[]const u8 = null,
 
     /// Reply to the app with `payload`.
     pub fn reply(d: *Delegate, payload: []const u8) Allocator.Error!void {
-        try d.outbox.append(d.allocator, .{ .application = payload });
+        try d.replies.append(d.allocator, payload);
     }
 
     /// Reply with formatted text.
@@ -85,9 +78,10 @@ pub const Delegate = struct {
         try d.reply(try d.allocator.print(fmt, args));
     }
 
-    /// Emit `ContextUpdated`, replacing the per-batch delegate context.
-    pub fn setContext(d: *Delegate, data: []const u8) Allocator.Error!void {
-        try d.outbox.append(d.allocator, .{ .context_updated = data });
+    /// Replace the delegate context (scratch state within one message batch).
+    pub fn setContext(d: *Delegate, data: []const u8) error{ContextWriteFailed}!void {
+        _ = d;
+        if (!host.contextWrite(data)) return error.ContextWriteFailed;
     }
 
     /// Fail the call with a message the app receives as
@@ -105,6 +99,20 @@ pub const Delegate = struct {
     /// Persistent, encrypted, per-delegate key/value storage on the user's node.
     pub fn secrets(d: *Delegate) Secrets {
         return .{ .allocator = d.allocator };
+    }
+
+    /// Fails the call unless the message came from the web app this delegate
+    /// belongs to. `freenet-pack` sets a delegate's parameters to its app's
+    /// contract id (32 bytes), and the node attests the sender's id in
+    /// `origin`, so no other site can pass. With no parameters, or any other
+    /// origin, it fails. Use as `try d.requireApp();` before anything that
+    /// reads or changes private data.
+    pub fn requireApp(d: *Delegate) error{DelegateFailed}!void {
+        const from_app = switch (d.origin) {
+            .web_app => |id| std.mem.eql(u8, &id, d.parameters),
+            else => false,
+        };
+        if (!from_app) return d.fail("this delegate only answers its own web app");
     }
 };
 
@@ -161,9 +169,12 @@ pub fn Exports(comptime Impl: type) type {
                 .parameters = parameters,
                 .origin = decodeOrigin(origin),
             };
-            const msg = decodeInbound(inbound) catch |err| return encodeError(@errorName(err));
-            Impl.handle(&d, msg) catch |err| return encodeError(d.failure orelse @errorName(err));
-            return encodeOk(d.outbox.items);
+            const msg = decodeInbound(inbound) catch |err| return encodeError(.deser, @errorName(err));
+            Impl.handle(&d, msg) catch |err| {
+                const failed = @as(anyerror, err) == error.DelegateFailed;
+                return encodeError(.other, if (failed) (d.failure orelse "DelegateFailed") else @errorName(err));
+            };
+            return encodeOk(d.replies.items);
         }
     };
 }
@@ -184,21 +195,6 @@ pub fn decodeOrigin(bytes: []const u8) Origin {
     };
 }
 
-pub fn encodeOrigin(w: *bincode.Writer, origin: Origin) Allocator.Error!void {
-    switch (origin) {
-        .none, .unknown => {},
-        .web_app => |id| {
-            try w.tag(0);
-            try w.raw(&id);
-        },
-        .delegate => |k| {
-            try w.tag(1);
-            try w.raw(&k.key);
-            try w.raw(&k.code_hash);
-        },
-    }
-}
-
 pub fn decodeInbound(bytes: []const u8) bincode.Error!Inbound {
     var r: bincode.Reader = .init(bytes);
     const t = try r.tag();
@@ -210,81 +206,31 @@ pub fn decodeInbound(bytes: []const u8) bincode.Error!Inbound {
     } };
 }
 
-pub fn encodeInbound(w: *bincode.Writer, msg: Inbound) Allocator.Error!void {
-    switch (msg) {
-        .application => |app| {
-            try w.tag(0);
-            try w.bytes(app.payload);
-            try w.bytes(app.context);
-            try w.boolean(app.processed);
-        },
-        .unsupported => |u| try w.raw(u.raw),
-    }
-}
-
-fn encodeOk(outbox: []const Outbound) []const u8 {
+/// `Ok(Vec<OutboundDelegateMsg>)`, one `ApplicationMessage` per reply.
+fn encodeOk(replies: []const []const u8) []const u8 {
     var w: bincode.Writer = .init(abi.allocator);
-    encodeOutbound(&w, outbox) catch @trap();
+    encodeReplies(&w, replies) catch @trap();
     return w.items();
 }
 
-/// `Ok(Vec<OutboundDelegateMsg>)`
-pub fn encodeOutbound(w: *bincode.Writer, outbox: []const Outbound) Allocator.Error!void {
+fn encodeReplies(w: *bincode.Writer, replies: []const []const u8) Allocator.Error!void {
     try w.tag(0); // Ok
-    try w.int(u64, outbox.len);
-    for (outbox) |msg| switch (msg) {
-        .application => |payload| {
-            try w.tag(0); // ApplicationMessage
-            try w.bytes(payload);
-            try w.bytes(""); // context (the node clears it anyway)
-            try w.boolean(true); // processed: deliver to the app
-        },
-        .context_updated => |data| {
-            try w.tag(2); // ContextUpdated(DelegateContext)
-            try w.bytes(data);
-        },
-    };
+    try w.int(u64, replies.len);
+    for (replies) |payload| {
+        try w.tag(0); // ApplicationMessage
+        try w.bytes(payload);
+        try w.bytes(""); // context (the node clears it anyway)
+        try w.boolean(true); // processed: deliver to the app
+    }
 }
 
-/// `Err(DelegateError::Other(message))`
-fn encodeError(message: []const u8) []const u8 {
+const ErrorKind = enum(u32) { deser = 0, other = 1 };
+
+/// `Err(DelegateError::Deser(message))` or `Err(DelegateError::Other(message))`
+fn encodeError(kind: ErrorKind, message: []const u8) []const u8 {
     var w: bincode.Writer = .init(abi.allocator);
     w.tag(1) catch @trap(); // Err
-    w.tag(1) catch @trap(); // DelegateError::Other
+    w.tag(@backingInt(kind)) catch @trap();
     w.bytes(message) catch @trap();
     return w.items();
-}
-
-/// Result of a delegate call as decoded by `freenet.testing` (and useful for
-/// anyone decoding delegate output).
-pub const Result = union(enum) {
-    ok: []const Outbound,
-    err: []const u8,
-};
-
-pub fn decodeResult(gpa: Allocator, bytes: []const u8) !Result {
-    var r: bincode.Reader = .init(bytes);
-    switch (try r.tag()) {
-        0 => {
-            const n = try r.int(u64);
-            var out: std.ArrayList(Outbound) = .empty;
-            for (0..n) |_| switch (try r.tag()) {
-                0 => {
-                    const payload = try r.bytes();
-                    _ = try r.bytes();
-                    _ = try r.boolean();
-                    try out.append(gpa, .{ .application = payload });
-                },
-                2 => try out.append(gpa, .{ .context_updated = try r.bytes() }),
-                else => return error.UnsupportedOutbound,
-            };
-            if (r.remaining() != 0) return error.TrailingBytes;
-            return .{ .ok = out.items };
-        },
-        1 => {
-            _ = try r.tag(); // DelegateError variant (Deser = 0, Other = 1)
-            return .{ .err = try r.bytes() };
-        },
-        else => return error.BadResultTag,
-    }
 }

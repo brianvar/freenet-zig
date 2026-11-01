@@ -9,17 +9,13 @@ const std = @import("std");
 const abi = @import("abi.zig");
 
 // ---- instance id ------------------------------------------------------------
-// The node calls the exported `__frnt_set_id` after instantiation; the rand,
-// log and time imports need that id. Delegate secrets/context don't.
+// The node calls the exported `__frnt_set_id` after instantiation; the rand
+// and log imports need that id. Delegate secrets/context don't.
 
 var instance_id: i64 = -1;
 
 pub fn setInstanceId(id: i64) callconv(.c) void {
     instance_id = id;
-}
-
-pub fn instanceId() i64 {
-    return instance_id;
 }
 
 // ---- node imports (only referenced on wasm32) ------------------------------
@@ -49,12 +45,18 @@ fn len32(s: []const u8) i32 {
     return @intCast(s.len);
 }
 
+/// A byte count the node returned, limited to the buffer we gave it.
+fn clamp(n: i32, max: usize) usize {
+    return @min(@as(usize, @intCast(@max(n, 0))), max);
+}
+
 // ---- randomness -------------------------------------------------------------
 
 /// Cryptographically secure randomness from the node.
 ///
 /// Only use this in delegates: a contract must compute the same result on
-/// every peer, so contracts cannot use randomness meaningfully.
+/// every peer, so contracts cannot use randomness meaningfully
+/// (`freenet-check-wasm` rejects contracts that import it).
 pub const random = struct {
     pub const Error = error{RandUnavailable};
 
@@ -119,7 +121,7 @@ pub fn contextRead(gpa: std.mem.Allocator) error{OutOfMemory}![]u8 {
     if (len <= 0) return &.{};
     const buf = try gpa.alloc(u8, @intCast(len));
     const n = imports.__frnt__delegate__ctx_read(p(buf.ptr), len);
-    return buf[0..@intCast(@max(n, 0))];
+    return buf[0..clamp(n, buf.len)];
 }
 
 pub fn contextWrite(data: []const u8) bool {
@@ -141,7 +143,7 @@ pub fn secretGet(gpa: std.mem.Allocator, key: []const u8) error{OutOfMemory}!?[]
     const buf = try gpa.alloc(u8, @intCast(@max(len, 1)));
     const n = imports.__frnt__delegate__get_secret(p(key.ptr), len32(key), p(buf.ptr), len);
     if (n < 0) return null;
-    return buf[0..@intCast(n)];
+    return buf[0..clamp(n, buf.len)];
 }
 
 pub fn secretSet(key: []const u8, value: []const u8) bool {
@@ -181,7 +183,7 @@ pub fn secretList(gpa: std.mem.Allocator, prefix: []const u8) error{OutOfMemory}
     const n = imports.__frnt__delegate__list_secrets(p(prefix.ptr), len32(prefix), p(buf.ptr), len);
     if (n <= 0) return &.{};
     // records: [u32 LE key length][key bytes] ...
-    var rest = buf[0..@intCast(n)];
+    var rest = buf[0..clamp(n, buf.len)];
     while (rest.len >= 4) {
         const klen = std.mem.readInt(u32, rest[0..4], .little);
         if (rest.len - 4 < klen) break;

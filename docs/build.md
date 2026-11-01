@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
 const d = freenet.addDelegate(b, dep, .{
     .name = "random",                          // artifact name; page uses client.delegate("random")
     .root_source_file = b.path("src/delegate.zig"),
-    .optimize = .small,                        // default
+    .optimize = .safe,                         // default; .small drops safety checks
 });
 const c = freenet.addContract(b, dep, .{ .name = "counter", .root_source_file = b.path("src/counter.zig") });
 ```
@@ -28,28 +28,33 @@ These compile for `wasm32-freestanding`, with the `freenet` module importable,
 and export exactly the ABI functions plus `memory`. The root file must call
 `exportDelegate` or `exportContract`.
 
+The default, `.safe` (ReleaseSafe), keeps bounds, overflow and `unreachable`
+checks: a bug traps instead of silently corrupting the result. Contracts run on
+every peer with input from strangers, so keep it unless size really matters.
+With `.small` those bugs are undefined behaviour. Debug info is always
+stripped from the Wasm: the node refuses modules that contain it.
+
 Both return a normal `*std.Build.Step.Compile`. Install it with
 `b.installArtifact(d)` to get `zig-out/bin/random.wasm`.
 
 ### addWebApp
 
-Packs a page, delegates and contract code with the built-in web container. See
-[web-apps.md](web-apps.md#addwebapp).
+Packs a page, delegates and contract code with the built-in signed web
+container. Needs a `signing_key`. See [web-apps.md](web-apps.md#addwebapp).
 
 ### addTests
 
 ```zig
-const tests = freenet.addTests(b, dep, .{
+freenet.addTests(b, dep, b.step("test", "Run tests"), .{
     .sources = &.{ b.path("src/delegate.zig") },   // native tests (freenet.testing)
     .delegates = &.{d},                           // ABI-check these Wasm modules...
     .contracts = &.{app.contract, c},             // ...and these
 });
-b.step("test", "Run tests").dependOn(tests);
 ```
 
-`addWebApp` and `addTests` each create a named top-level step (`install-site`,
-`freenet-tests`), so call each once per build. For several web apps, give each
-its own `install_dir`.
+`addTests` adds everything to the step you pass, so it can be called more than
+once. `addWebApp` creates a named step (`install-<install_dir>`); for several
+web apps, give each its own `install_dir`.
 
 ## Tools
 
@@ -60,20 +65,32 @@ run them by hand: `zig build` in this repository installs them to `zig-out/bin`.
 
 ```
 freenet-pack --web-contract <web_container.wasm> --client <freenet.js> --out-dir <dir>
+             --key <key name> [--version <n>]
              --file index.html=<path> [--file <name>=<path>]...
              [--delegate <name>=<delegate.wasm>]...
              [--embed-contract <name>=<contract.wasm>]...
 ```
 
-1. In `.html` files, replaces the script tag for `freenet.js` with the inlined
-   client plus `FreenetClient.embedded = { name: { wasm, key, codeHash } }`
-   (delegates) and `FreenetClient.contracts = { name: { wasm, codeHash } }`.
-2. Packs the files into `web.tar.xz`, then the web-app state.
-3. Sets the parameters to BLAKE3(state) and computes the contract key.
+1. Reads the signing key and computes the app's id: the contract key,
+   BLAKE3(BLAKE3(web container code) ‖ public key).
+2. Writes the archive file `freenet.js`: the client plus
+   `FreenetClient.embedded = { name: { wasm, key, codeHash, parameters } }`
+   (delegates; `parameters` is the app id, which is also part of `key`) and
+   `FreenetClient.contracts = { name: { wasm, codeHash } }`.
+3. Packs the files and `freenet.js` into `web.tar.xz`, signs it as release
+   `--version` (default: the Unix time) and builds the web-app state.
 
-It writes `state.bin`, `params.bin`, `web.tar.xz` and `site.txt`. It fails if
-`index.html` is missing, or if delegates or contracts are given but no page
-includes the client.
+`--key` is the name of a key made by `fdev website init <name>`, found in
+freenet's config directory like `fdev` does, or a file path (see
+[web-apps.md](web-apps.md#the-signing-key)).
+
+It writes `web_container.wasm` (a copy of the contract), `state.bin`,
+`params.bin` (the public key), `web.tar.xz` and `site.txt`. It fails if the key
+is missing or malformed; if `index.html` is missing;
+if a name isn't a plain relative path (letters, digits, `_`, `-`, `.`, `/`; no
+empty, `.` or `..` parts); if a file is itself named `freenet.js`; if
+delegates or contracts are given but no page mentions `freenet.js`; or if the
+state is larger than the node accepts (50 MiB).
 
 ### freenet-check-wasm
 
@@ -87,8 +104,10 @@ For each module it checks two things:
   - Delegates: `process`, `__frnt__initiate_buffer`, `__frnt_set_id`.
   - Contracts: `validate_state`, `update_state`, `summarize_state`,
     `get_state_delta`, `__frnt__initiate_buffer`, `__frnt_set_id`.
-- **Imports** must come from what the node provides for that kind: random, log
-  and time for both; context and secrets for delegates only.
+- **Imports** must come from what the node provides for that kind: log and
+  time for both; random, context and secrets for delegates only. (The node
+  does give contracts randomness, but a contract must compute the same result
+  on every peer, so the checker treats it as a bug.)
 
 This catches problems that would otherwise surface as a cryptic load failure on
 the node, such as a typo in an export or a leaked toolchain symbol like
@@ -97,5 +116,6 @@ the node, such as a typo in an export or a leaked toolchain symbol like
 ## Library development
 
 ```sh
-zig build test   # library unit + wire-format tests, and an ABI check of the web container
+zig build test      # library unit + wire-format tests, and an ABI check of the web container
+# and open js/test.html in a browser: tests for the browser client
 ```

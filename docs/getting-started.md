@@ -65,6 +65,10 @@ pub fn handle(d: *freenet.Delegate, msg: freenet.Inbound) !void {
 `exportDelegate` generates the Wasm entry points Freenet calls. `handle` runs
 once per message; whatever you `reply` goes back to the page.
 
+Any site on the user's node can message your delegate. If it does anything
+private, start `handle` with `try d.requireApp();`, which refuses everyone but
+your own page (see [delegates.md](delegates.md#origin-whos-asking)).
+
 ## 3. The page
 
 ```html
@@ -87,9 +91,8 @@ once per message; whatever you `reply` goes back to the page.
 </script>
 ```
 
-You don't provide `freenet.js` yourself. At build time that tag is replaced with
-the client library and your compiled delegate, so the published page is one
-self-contained HTML file.
+You don't provide `freenet.js` yourself. At build time it's generated into the
+site: the client library plus your compiled delegate.
 
 ## 4. The build
 
@@ -108,17 +111,31 @@ pub fn build(b: *std.Build) void {
 
     const app = freenet.addWebApp(b, dep, .{
         .page = b.path("web/index.html"),
+        .signing_key = "my-app", // the key's name, see below
         .delegates = &.{greeter},
     });
     b.getInstallStep().dependOn(app.install);
 }
 ```
 
-Run `zig build`. You get:
+A site is signed by you. Make the key once with freenet's own tool, and keep
+it private (it's the identity of your app; whoever has it can replace the
+site, and if you lose it you can never update it):
+
+```sh
+fdev website init my-app
+```
+
+`.signing_key` is just the name. The build finds the key where `fdev` stored it
+(Linux `~/.config/freenet/website-keys/my-app.toml`, macOS
+`~/Library/Application Support/freenet/website-keys/my-app.toml`), so the
+same `build.zig` works on every machine that has that key.
+
+Run `zig build`. (A missing key fails with `cannot read the signing key`.) You get:
 
 ```
-zig-out/bin/greeter.wasm          the delegate (also embedded in the page)
-zig-out/bin/web_container.wasm    the contract that stores the site
+zig-out/bin/greeter.wasm          the delegate (also embedded in the site)
+zig-out/site/web_container.wasm   the contract that stores the site
 zig-out/site/state.bin            the site, as the contract's state
 zig-out/site/params.bin           the contract's parameters
 zig-out/site/web.tar.xz           the site's files (for inspection)
@@ -151,16 +168,20 @@ Load the site into it:
 
 ```sh
 fdev publish \
-  --code zig-out/bin/web_container.wasm \
+  --code zig-out/site/web_container.wasm \
   --parameters zig-out/site/params.bin \
   contract --state zig-out/site/state.bin
 ```
 
 Open the URL from `zig-out/site/site.txt`, changing the port if you used 7510.
 
-Every change gives the site a new key, because the contract is
-content-addressed. After editing, run `zig build`, publish again, and open the
-new URL.
+The site's key and URL come from your signing key, so they stay the same
+across releases. After editing, run `zig build` (each build is a newer release)
+and publish again with the same command; the node accepts a release only if it
+is signed by your key and newer than the one it has. The same goes for
+rebuilding with a different Zig version, which changes the compiled container
+and so the key: keep one toolchain for an app (see
+[web-apps.md](web-apps.md#the-web-container)).
 
 ## 6. Test without a node
 
@@ -177,12 +198,11 @@ test "greets" {
 and wire them up in `build.zig`:
 
 ```zig
-const tests = freenet.addTests(b, dep, .{
+freenet.addTests(b, dep, b.step("test", "Run tests"), .{
     .sources = &.{b.path("src/delegate.zig")},
     .delegates = &.{greeter},
     .contracts = &.{app.contract},
 });
-b.step("test", "Run tests").dependOn(tests);
 ```
 
 `zig build test` runs your tests natively and checks the compiled Wasm against

@@ -39,6 +39,10 @@ const Echo = struct {
             .application => |app| {
                 if (std.mem.eql(u8, app.payload, "fail")) return d.fail("nope");
                 if (std.mem.eql(u8, app.payload, "boom")) return error.Boom;
+                if (std.mem.eql(u8, app.payload, "stale")) {
+                    d.failure = "handled"; // as if it had called d.fail(...) and recovered
+                    return error.Boom;
+                }
                 if (std.mem.eql(u8, app.payload, "ctx")) return d.setContext("c1");
                 if (std.mem.eql(u8, app.payload, "origin")) return d.replyFmt("{s}", .{@tagName(d.origin)});
                 try d.reply(app.payload);
@@ -55,21 +59,57 @@ test "delegate: reply bytes" {
     try testing.expectEqualSlices(u8, &expected, out);
 }
 
-test "delegate: ContextUpdated bytes" {
+test "delegate: setContext writes the node's context" {
+    t.reset();
     const out = t.raw.callDelegate(Echo, "", &web_origin, &appMsg("ctx"));
-    const expected = le32(0) ++ le64(1) ++ le32(2) ++ vec("c1");
-    try testing.expectEqualSlices(u8, &expected, out);
+    try testing.expectEqualSlices(u8, &(le32(0) ++ le64(0)), out); // Ok, no messages
+    try testing.expectEqualStrings("c1", t.context());
 }
 
-test "delegate: errors become DelegateError::Other" {
+test "delegate: errors become DelegateError::Other, malformed input Deser" {
     try testing.expectEqualSlices(u8, &(le32(1) ++ le32(1) ++ vec("nope")), t.raw.callDelegate(Echo, "", &web_origin, &appMsg("fail")));
     try testing.expectEqualSlices(u8, &(le32(1) ++ le32(1) ++ vec("Boom")), t.raw.callDelegate(Echo, "", &web_origin, &appMsg("boom")));
-    try testing.expectEqualSlices(u8, &(le32(1) ++ le32(1) ++ vec("EndOfStream")), t.raw.callDelegate(Echo, "", &web_origin, &.{ 0, 0, 0, 0, 0xff }));
+    // a fail() message the delegate recovered from doesn't stick to a later error
+    try testing.expectEqualSlices(u8, &(le32(1) ++ le32(1) ++ vec("Boom")), t.raw.callDelegate(Echo, "", &web_origin, &appMsg("stale")));
+    try testing.expectEqualSlices(u8, &(le32(1) ++ le32(0) ++ vec("EndOfStream")), t.raw.callDelegate(Echo, "", &web_origin, &.{ 0, 0, 0, 0, 0xff }));
 }
 
 test "delegate: other inbound variants (e.g. Lifecycle, tag 10) reach handle as .unsupported" {
     const out = t.raw.callDelegate(Echo, "", "", &(le32(10) ++ le32(0)));
     try testing.expectEqualSlices(u8, &(le32(0) ++ le64(0)), out);
+}
+
+const Guarded = struct {
+    pub fn handle(d: *freenet.Delegate, msg: freenet.Inbound) !void {
+        switch (msg) {
+            .application => {
+                try d.requireApp();
+                try d.reply("secret");
+            },
+            .unsupported => {},
+        }
+    }
+};
+
+test "delegate: requireApp lets in only the app named by the parameters" {
+    t.reset();
+    const app: [32]u8 = @splat(7); // the default origin's id
+    try testing.expectEqualStrings("secret", (try t.ask(Guarded, "x", .{ .parameters = &app }))[0]);
+
+    const stranger: [32]u8 = @splat(9);
+    const refused = try t.send(Guarded, .{ .application = .{ .payload = "x" } }, .{ .parameters = &stranger });
+    try testing.expectEqualStrings("this delegate only answers its own web app", refused.err);
+
+    // no parameters: nobody is let in
+    const unset = try t.send(Guarded, .{ .application = .{ .payload = "x" } }, .{});
+    try testing.expectEqualStrings("this delegate only answers its own web app", unset.err);
+
+    // other delegates and unknown origins are refused too
+    const from_delegate = try t.send(Guarded, .{ .application = .{ .payload = "x" } }, .{
+        .parameters = &app,
+        .origin = .{ .delegate = .{ .key = @splat(7), .code_hash = @splat(7) } },
+    });
+    try testing.expectEqualStrings("this delegate only answers its own web app", from_delegate.err);
 }
 
 test "delegate: origins" {
@@ -130,7 +170,13 @@ const Counter = struct {
     pub fn updateState(c: *freenet.Contract, state: []const u8, updates: *freenet.Updates) !freenet.UpdateResult {
         var n = std.fmt.parseInt(u64, state, 10) catch return error.InvalidState;
         while (try updates.next()) |u| switch (u) {
-            .delta => |d| n += std.fmt.parseInt(u64, d[1..], 10) catch return c.fail("bad delta"),
+            .delta => |d| {
+                if (std.mem.eql(u8, d, "stale")) {
+                    c.failure = "handled"; // as if it had called c.fail(...) and recovered
+                    return error.InvalidDelta;
+                }
+                n += std.fmt.parseInt(u64, d[1..], 10) catch return c.fail("bad delta");
+            },
             .related_state => return .{ .requires = &.{.{ .id = @splat(9), .mode = .state_then_subscribe }} },
             else => return error.InvalidUpdate,
         };
@@ -169,6 +215,8 @@ test "contract: error mapping bytes" {
     const bad_delta = le64(1) ++ le32(1) ++ vec("+x");
     // c.fail in update -> InvalidUpdateWithInfo { reason }
     try testing.expectEqualSlices(u8, &(le32(1) ++ le32(2) ++ vec("bad delta")), try t.raw.callContract(Counter, .update_state, "", "1", &bad_delta));
+    // a recovered c.fail() doesn't override a later error: InvalidDelta
+    try testing.expectEqualSlices(u8, &(le32(1) ++ le32(4)), try t.raw.callContract(Counter, .update_state, "", "1", &(le64(1) ++ le32(1) ++ vec("stale"))));
     // error.InvalidState -> InvalidState
     try testing.expectEqualSlices(u8, &(le32(1) ++ le32(3)), try t.raw.callContract(Counter, .update_state, "", "x", &(le64(0))));
     // error.InvalidUpdate -> InvalidUpdate

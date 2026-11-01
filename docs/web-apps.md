@@ -10,6 +10,8 @@ sandboxed iframe and reaches the network only through the node's WebSocket API.
 ```zig
 const app = freenet.addWebApp(b, dep, .{
     .page = b.path("web/index.html"),           // becomes index.html
+    .signing_key = "my-app",                    // key name from `fdev website init`; see "The signing key"
+    .version = null,                            // release number; default: build time
     .delegates = &.{random, wallet},            // from addDelegate; embedded in the page
     .contracts = &.{chat_room},                 // from addContract; code embedded for client.contract(...)
     .files = &.{                                // optional extra files
@@ -25,11 +27,11 @@ It builds the web-container contract, runs `freenet-pack`, and installs:
 
 | Output | What |
 |---|---|
+| `zig-out/site/web_container.wasm` | the contract |
 | `zig-out/site/state.bin` | the contract state (your site) |
-| `zig-out/site/params.bin` | the contract parameters |
+| `zig-out/site/params.bin` | the contract parameters (the public key) |
 | `zig-out/site/web.tar.xz` | the archive inside the state |
-| `zig-out/site/site.txt` | contract key, local URL, delegate keys |
-| `zig-out/bin/web_container.wasm` | the contract |
+| `zig-out/site/site.txt` | contract key, local URL, release, delegate keys |
 | `zig-out/bin/<delegate>.wasm` | each delegate |
 | `zig-out/bin/<contract>.wasm` | each embedded contract |
 
@@ -38,15 +40,17 @@ directory as a `LazyPath`) and `.install`.
 
 ## The page
 
-Put this tag in your HTML exactly as written:
+Load the client with:
 
 ```html
 <script src="freenet.js"></script>
 ```
 
-`freenet-pack` replaces it, in every `.html` file, with the client library,
-your delegates (Wasm in base64, plus their keys), and your contracts' code. The
-published page needs no other files.
+`freenet-pack` generates `freenet.js` into the archive: the client library,
+your delegates (Wasm in base64, plus their keys and parameters), and your
+contracts' code. It
+defines one global, `FreenetClient`; other names in your scripts can't clash
+with it.
 
 Extra files go into the archive as they are. Reference them with relative
 paths (`<link rel="stylesheet" href="style.css">`).
@@ -62,17 +66,18 @@ Connects to the node that served the page. Options:
 | Option | Default | |
 |---|---|---|
 | `url` | the page's host + `/v1/contract/command?encodingProtocol=native` | WebSocket URL |
-| `reconnect` | `true` | reconnect after 2 s; delegates are re-registered automatically |
+| `reconnect` | `true` | after losing the connection (or a request timing out), reconnect every 2 s; delegates are re-registered automatically |
 | `onStatus(s)` | no-op | called with `"connecting"`, `"open"` or `"closed"` |
 
-Rejects if the first connection fails.
+Rejects if the first connection fails; nothing is retried in that case.
 
 ```js
 const d = await client.delegate("name");
 ```
 
 Registers the embedded delegate named `name` (the `.name` from `addDelegate`)
-with the node, once, and returns a handle.
+with the node, once (concurrent calls share the registration), and returns a
+handle.
 
 ```js
 const replies = await d.send(bytesOrString);   // Uint8Array[]
@@ -98,7 +103,8 @@ the 32-byte id; `handle.idString` is the base58 form Freenet prints.
 
 `client.contractAt` addresses an instance you didn't embed, for example
 another app's contract. `codeHash` (hex, base58 or bytes) is needed only for
-updates, and is also learned from `get()`.
+updates, and is also learned from `get()`. Both must be 32 bytes; anything
+else throws a `TypeError`.
 
 | Method | |
 |---|---|
@@ -107,9 +113,10 @@ updates, and is also learned from `get()`.
 | `await h.put(state, { subscribe? })` | create the instance with an initial state (needs the code: embedded contracts only). The node runs your `validateState` first |
 | `await h.update(delta)` | send `UpdateData::Delta`; your `updateState` merges it. Resolves to the new summary |
 | `await h.updateState(state)` | send `UpdateData::State`, a whole proposed state |
-| `const off = await h.subscribe(fn)` | call `fn({ state?, delta? })` (Uint8Arrays) on every change; `off()` removes `fn` |
+| `const off = await h.subscribe(fn)` | call `fn({ state?, delta? })` (Uint8Arrays) on every change; resolves once the node confirmed; `off()` removes `fn` |
 
-`state` and `delta` arguments may be strings or `Uint8Array`s.
+`state` and `delta` arguments may be strings, `Uint8Array`s (or other typed
+arrays) or `ArrayBuffer`s.
 
 The usual page flow:
 
@@ -126,42 +133,104 @@ button.onclick = () => counter.update(`${me}:${n + 1}\n`);
 
 `examples/counter` is the complete version.
 
+### Helpers
+
+`FreenetClient.util` has the functions the client uses for ids, for pages that
+need them too: `blake3(bytes)` (32 bytes), `base58Encode`, `base58Decode`,
+`hexToBytes`, `bytesToHex` and `concatBytes`. Nothing else from the client is
+global.
+
 ### Behavior
 
 - **Ordering.** Requests go out one at a time over one connection. Calling
   methods concurrently is fine: calls queue and resolve in order. Each waits up
-  to 30 s for the node.
+  to 30 s for the node. The node's replies carry no request id, so after a
+  timeout the client drops the connection (and reconnects, if enabled) rather
+  than risk taking a late reply as the answer to the next request.
 - **Notifications** arrive at any time and go to `subscribe` callbacks, never to
   the request waiting for a reply.
 - **Large responses** (over 512 KiB) are reassembled transparently.
-- **Reconnecting** re-registers delegates and renews subscriptions.
-- **Errors.** Node errors, such as a contract rejecting an update, reject the
-  promise with the node's message.
+- **Reconnecting** re-registers delegates and renews subscriptions. Changes
+  made while disconnected are not replayed; call `get()` if you need them.
+- **Errors.** Refusals from the node, such as a contract rejecting an update,
+  reject with a `FreenetClient.Error` whose `kind` names the node's error
+  (`"MissingContract"`, `"Update"`, `"DelegateExecutionError"`, ...), with
+  `cause`, `contract` or `delegate` where the node gives them. For a delegate
+  failure, `message` is the delegate's own message. Connection problems
+  (`"not connected"`, `"timed out ..."`, `"connection closed"`) reject with a
+  plain `Error`.
+- **Sandbox.** Pages run in an iframe without `allow-same-origin`, so
+  `localStorage`, cookies and IndexedDB are unavailable. Keep per-user data in a
+  delegate's secrets (`examples/counter` keeps its visitor id that way).
 
 ```js
 client.close();
 ```
 
+## The signing key
+
+A site is signed by its publisher, and the key decides the app's identity. Use
+freenet's own tool to make the key:
+
+```sh
+fdev website init my-app
+```
+
+It writes `my-app.toml` into freenet's config directory (Linux:
+`~/.config/freenet/website-keys/`; macOS: `~/Library/Application Support/freenet/website-keys/`),
+and prints the app's address for freenet's own container. In `build.zig` you
+give only the name, `.signing_key = "my-app"`, exactly as `fdev website
+publish --key my-app` does. `freenet-pack` finds the file itself, so the
+build file is the same on every machine that has the key, and the key never
+enters the repository.
+
+For CI you can pass a file path instead of a name (a value containing `/` or
+`\`, or ending in `.toml` or `.key`). The file is an `fdev` key file or just the
+32-byte seed as 64 hex characters (`openssl rand -hex 32`).
+
+**Keep it private and back it up**: whoever has it can replace your site, and
+if you lose it you can never update the site again. Don't commit it. The
+address `fdev` prints is for freenet's container; this library's container has
+its own code, so the app's key (in `site.txt`) differs.
+
+Because the key is read from outside the project, `zig build` packs the site
+again on every build instead of reusing a cached result.
+
+Each build is a *release*, numbered by the Unix time of the build (or
+`.version = n`). The container accepts only a release higher than the current
+one, so republishing needs a later build, never an earlier one.
+
 ## The web container
 
-`addWebApp` uses `freenet.WebContainer` (`src/webcontainer.zig`), a
-**content-addressed** contract:
+`addWebApp` uses `freenet.WebContainer` (`src/webcontainer.zig`), a **signed
+site** contract, modelled on freenet-core's `fdev website`:
 
-- parameters = BLAKE3(state), so the contract key commits to the exact bytes
-- `validateState` accepts only that state, and only if it has the web-app layout
-- `updateState` accepts only that same state, so nobody can replace the site
+- parameters = the publisher's Ed25519 public key
+- `validateState` accepts a state only if its metadata (CBOR: version and
+  signature) verifies against that key over `version ‖ archive`
+- `updateState` accepts a state only if it is signed by the same key and has a
+  higher version; the same state again is a no-op
+
+States are byte-compatible with `fdev website`, so either tool's output is
+valid for either contract.
 
 Consequences:
 
-- Every change to the page or a delegate gives a **new key and URL**. Old
-  versions stay reachable at their old keys.
-- Nobody, not even you, can deface a published version.
+- The app's id is BLAKE3(BLAKE3(container code) ‖ public key). It does **not**
+  depend on the site, so every release keeps the **same key and URL**, and
+  the id is known before the site is built.
+- Whoever holds the signing key can change the site. Nobody else can.
+- The id depends on the compiled container, so building with a different Zig
+  version (or optimize mode) changes it, even with the same key. Publishing
+  that build is a different app. Keep the toolchain the same for an app's
+  lifetime, or publish with a stored `web_container.wasm`.
+- `freenet-pack` gives each delegate the app's id as its **parameters**, so a
+  delegate can tell whether a message comes from its own app:
+  `try d.requireApp()` (see [delegates.md](delegates.md#origin-whos-asking)).
+  Users of other sites on the same node can't use your delegates.
 
-For a site that updates in place under one key, write your own contract: put a
-public key in the parameters, and accept a new state only with a valid
-signature. freenet-core's `fdev website` does this in Rust. The layout helpers
-in `freenet.webapp` (`pack`, `buildState`, `parseState`) help with the state
-format.
+The layout helpers in `freenet.webapp` (`tar`, `xzStore`, `buildState`,
+`parseState`, `signState`, `verifyState`) help if you write your own container.
 
 ## State layout
 
@@ -170,13 +239,14 @@ format.
 ```
 
 The archive is a valid `.xz` that stores the data uncompressed. Zig has no xz
-encoder, and this keeps the build free of external tools. Sites are a little
-larger as a result; the limit is far above what a page needs.
+encoder, and this keeps the build free of external tools. Sites are larger as
+a result, and embedded Wasm grows by a third as base64. The node stores at most
+50 MiB per state; `freenet-pack` fails above that.
 
 ## Publishing
 
 ```sh
-fdev publish --code zig-out/bin/web_container.wasm --parameters zig-out/site/params.bin \
+fdev publish --code zig-out/site/web_container.wasm --parameters zig-out/site/params.bin \
   contract --state zig-out/site/state.bin
 ```
 

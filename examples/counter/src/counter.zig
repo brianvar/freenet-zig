@@ -9,9 +9,12 @@
 //! A delta is just entry lines. Merging takes the maximum per visitor, so it
 //! is commutative and idempotent: peers that see the same updates in any
 //! order, even repeated, end up with identical states. The total is the sum.
+//! Visitor ids come from the `visitor` delegate (src/visitor.zig).
 //!
-//! (A demo: anyone can claim any visitor id. A real app would have each
-//! visitor sign their entry, for example with a key held in a delegate.)
+//! (A demo: anyone can claim any visitor id, and anyone can fill the counter
+//! up to `max_entries` with made-up ids, after which it accepts no new
+//! visitors. A real app would have each visitor sign their entry, for example
+//! with a key held in a delegate.)
 
 const std = @import("std");
 const freenet = @import("freenet");
@@ -25,7 +28,7 @@ const max_entries = 10_000;
 
 const Entry = struct { id: [16]u8, count: u64 };
 
-/// Parses entry lines into `out` (merging by max). `with_header`: a full state.
+/// Appends the entry lines of `text` to `out`. `with_header`: a full state.
 fn parseInto(gpa: std.mem.Allocator, out: *std.ArrayList(Entry), text: []const u8, with_header: bool) !void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     if (with_header and !std.mem.eql(u8, lines.next() orelse "", header)) return error.InvalidState;
@@ -35,27 +38,33 @@ fn parseInto(gpa: std.mem.Allocator, out: *std.ArrayList(Entry), text: []const u
         const id = line[0..16].*;
         for (id) |ch| if (!std.ascii.isHex(ch) or std.ascii.isUpper(ch)) return error.InvalidState;
         const count = std.fmt.parseInt(u64, line[17..], 10) catch return error.InvalidState;
-        try merge(gpa, out, .{ .id = id, .count = count });
-        if (out.items.len > max_entries) return error.InvalidState;
+        try out.append(gpa, .{ .id = id, .count = count });
     }
 }
 
-fn merge(gpa: std.mem.Allocator, entries: *std.ArrayList(Entry), e: Entry) !void {
-    for (entries.items) |*existing| {
-        if (std.mem.eql(u8, &existing.id, &e.id)) {
-            existing.count = @max(existing.count, e.count);
-            return;
+/// Sorts by id and keeps the largest count per id (O(n log n)), so the
+/// result doesn't depend on the order entries arrived in.
+fn normalize(entries: *std.ArrayList(Entry)) !void {
+    std.mem.sort(Entry, entries.items, {}, lessThan);
+    var n: usize = 0;
+    for (entries.items) |e| {
+        if (n > 0 and std.mem.eql(u8, &entries.items[n - 1].id, &e.id)) {
+            entries.items[n - 1].count = @max(entries.items[n - 1].count, e.count);
+        } else {
+            entries.items[n] = e;
+            n += 1;
         }
     }
-    try entries.append(gpa, e);
+    entries.shrinkRetainingCapacity(n);
+    if (n > max_entries) return error.InvalidState;
 }
 
 fn lessThan(_: void, x: Entry, y: Entry) bool {
     return std.mem.lessThan(u8, &x.id, &y.id);
 }
 
-fn serialize(gpa: std.mem.Allocator, entries: []Entry) ![]const u8 {
-    std.mem.sort(Entry, entries, {}, lessThan);
+/// `entries` must be normalized.
+fn serialize(gpa: std.mem.Allocator, entries: []const Entry) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     try out.writer.writeAll(header ++ "\n");
     for (entries) |e| try out.writer.print("{s}:{d}\n", .{ &e.id, e.count });
@@ -65,6 +74,7 @@ fn serialize(gpa: std.mem.Allocator, entries: []Entry) ![]const u8 {
 pub fn validateState(c: *freenet.Contract, state: []const u8, _: freenet.RelatedContracts) !freenet.ValidateResult {
     var entries: std.ArrayList(Entry) = .empty;
     parseInto(c.allocator, &entries, state, true) catch return .invalid;
+    normalize(&entries) catch return .invalid;
     // canonical form only (sorted, no duplicates), so equal counters are equal bytes
     const canonical = try serialize(c.allocator, entries.items);
     return if (std.mem.eql(u8, canonical, state)) .valid else .invalid;
@@ -82,6 +92,7 @@ pub fn updateState(c: *freenet.Contract, state: []const u8, updates: *freenet.Up
         },
         else => return c.fail("this contract has no related contracts"),
     };
+    try normalize(&entries);
     return .{ .new_state = try serialize(c.allocator, entries.items) };
 }
 
@@ -147,5 +158,19 @@ test "sync: delta brings a stale peer up to date" {
 
 test "garbage updates are rejected" {
     const res = try t.update(@This(), "", empty, &.{.{ .delta = "nope" }});
-    try testing.expectEqual(freenet.contract.ContractError.invalid_state, res.err);
+    try testing.expectEqual(freenet.testing.ContractError.invalid_state, res.err);
+}
+
+test "at most max_entries visitors" {
+    var full: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer full.deinit();
+    try full.writer.writeAll(empty);
+    for (0..max_entries) |i| try full.writer.print("{x:0>16}:1\n", .{i});
+    const state = full.written();
+    try testing.expectEqual(freenet.ValidateResult.valid, (try t.validate(@This(), "", state, .{})).ok);
+    // an existing visitor can still click; a new one can't join
+    const again = try t.update(@This(), "", state, &.{.{ .delta = "0000000000000000:2\n" }});
+    try testing.expect(again == .ok);
+    const newcomer = try t.update(@This(), "", state, &.{.{ .delta = "ffffffffffffffff:1\n" }});
+    try testing.expectEqual(freenet.testing.ContractError.invalid_state, newcomer.err);
 }

@@ -9,10 +9,7 @@
         "build.zig.zon",
         "src",
         "tools",
-        "js",
-        "docs",
-        "examples",
+        "js/freenet.js",
         "README.md",
-        "LICENSE",
     },
 }

@@ -55,6 +55,11 @@ pub fn putSecret(key: []const u8, value: []const u8) !void {
     if (!host.secretSet(key, value)) return error.OutOfMemory;
 }
 
+/// The delegate context as the last call left it (`d.setContext`).
+pub fn context() []const u8 {
+    return host.native.context.items;
+}
+
 // ---- delegates ---------------------------------------------------------------
 
 pub const SendOptions = struct {
@@ -62,48 +67,111 @@ pub const SendOptions = struct {
     parameters: []const u8 = "",
 };
 
-/// Send one inbound message to delegate `Impl`; returns what it emitted or
-/// the error message it failed with.
-pub fn send(comptime Impl: type, msg: delegate.Inbound, opts: SendOptions) !delegate.Result {
+/// What a delegate call returned: its reply payloads, or the error message
+/// it failed with.
+pub const Result = union(enum) {
+    ok: []const []const u8,
+    err: []const u8,
+};
+
+/// Send one inbound message to delegate `Impl`.
+pub fn send(comptime Impl: type, msg: delegate.Inbound, opts: SendOptions) !Result {
     var w: bincode.Writer = .init(gpa);
-    try delegate.encodeInbound(&w, msg);
+    try encodeInbound(&w, msg);
     var o: bincode.Writer = .init(gpa);
-    try delegate.encodeOrigin(&o, opts.origin);
-    return delegate.decodeResult(gpa, raw.callDelegate(Impl, opts.parameters, o.items(), w.items()));
+    try encodeOrigin(&o, opts.origin);
+    return decodeResult(raw.callDelegate(Impl, opts.parameters, o.items(), w.items()));
 }
 
 /// Send an `ApplicationMessage` with `payload` and return the payloads of
 /// the delegate's replies. Fails with `error.DelegateReturnedError` (after
 /// printing the message) if the delegate failed.
 pub fn ask(comptime Impl: type, payload: []const u8, opts: SendOptions) ![]const []const u8 {
-    const res = try send(Impl, .{ .application = .{ .payload = payload } }, opts);
-    switch (res) {
+    switch (try send(Impl, .{ .application = .{ .payload = payload } }, opts)) {
         .err => |m| {
             std.debug.print("delegate failed: {s}\n", .{m});
             return error.DelegateReturnedError;
         },
-        .ok => |out| {
-            var replies: std.ArrayList([]const u8) = .empty;
-            for (out) |m| switch (m) {
-                .application => |p| try replies.append(gpa, p),
-                .context_updated => {},
-            };
-            return replies.items;
+        .ok => |replies| return replies,
+    }
+}
+
+fn encodeOrigin(w: *bincode.Writer, origin: delegate.Origin) !void {
+    switch (origin) {
+        .none, .unknown => {},
+        .web_app => |id| {
+            try w.tag(0);
+            try w.raw(&id);
         },
+        .delegate => |k| {
+            try w.tag(1);
+            try w.raw(&k.key);
+            try w.raw(&k.code_hash);
+        },
+    }
+}
+
+fn encodeInbound(w: *bincode.Writer, msg: delegate.Inbound) !void {
+    switch (msg) {
+        .application => |app| {
+            try w.tag(0);
+            try w.bytes(app.payload);
+            try w.bytes(app.context);
+            try w.boolean(app.processed);
+        },
+        .unsupported => |u| try w.raw(u.raw),
+    }
+}
+
+/// Decodes `Result<Vec<OutboundDelegateMsg>, DelegateError>` as the library
+/// writes it (only `ApplicationMessage` replies).
+fn decodeResult(bytes: []const u8) !Result {
+    var r: bincode.Reader = .init(bytes);
+    switch (try r.tag()) {
+        0 => {
+            var replies: std.ArrayList([]const u8) = .empty;
+            for (0..@as(usize, @intCast(try r.int(u64)))) |_| {
+                if (try r.tag() != 0) return error.UnsupportedOutbound;
+                try replies.append(gpa, try r.bytes());
+                _ = try r.bytes(); // context
+                _ = try r.boolean(); // processed
+            }
+            if (r.remaining() != 0) return error.TrailingBytes;
+            return .{ .ok = replies.items };
+        },
+        1 => {
+            _ = try r.tag(); // DelegateError variant (Deser = 0, Other = 1)
+            return .{ .err = try r.bytes() };
+        },
+        else => return error.BadResultTag,
     }
 }
 
 // ---- contracts ---------------------------------------------------------------
 
+/// A `ContractError` as the node would receive it.
+pub const ContractError = union(enum) {
+    deser: []const u8,
+    invalid_update,
+    invalid_update_with_info: []const u8,
+    invalid_state,
+    invalid_delta,
+    other: []const u8,
+};
+
 pub fn Outcome(comptime T: type) type {
-    return union(enum) { ok: T, err: contract.ContractError };
+    return union(enum) { ok: T, err: ContractError };
 }
 
 pub fn validate(comptime Impl: type, parameters: []const u8, state: []const u8, related: contract.RelatedContracts) !Outcome(contract.ValidateResult) {
     var w: bincode.Writer = .init(gpa);
-    try related.encode(&w);
+    try w.int(u64, related.entries.len);
+    for (related.entries) |e| {
+        try w.raw(&e.id);
+        try w.optionalBytes(e.state);
+    }
     var r: bincode.Reader = .init(try raw.callContract(Impl, .validate_state, parameters, state, w.items()));
-    if (try r.tag() == 1) return .{ .err = try contract.decodeError(&r) };
+    if (try r.tag() == 1) return .{ .err = try decodeError(&r) };
     return .{ .ok = switch (try r.tag()) {
         0 => .valid,
         1 => .invalid,
@@ -118,9 +186,9 @@ pub fn validate(comptime Impl: type, parameters: []const u8, state: []const u8, 
 
 pub fn update(comptime Impl: type, parameters: []const u8, state: []const u8, updates: []const contract.Update) !Outcome(contract.UpdateResult) {
     var w: bincode.Writer = .init(gpa);
-    try contract.encodeUpdates(&w, updates);
+    try encodeUpdates(&w, updates);
     var r: bincode.Reader = .init(try raw.callContract(Impl, .update_state, parameters, state, w.items()));
-    if (try r.tag() == 1) return .{ .err = try contract.decodeError(&r) };
+    if (try r.tag() == 1) return .{ .err = try decodeError(&r) };
     const new_state = try r.optionalBytes();
     const reqs = try gpa.alloc(contract.RelatedRequest, @intCast(try r.int(u64)));
     for (reqs) |*req| req.* = .{ .id = try r.array(32), .mode = @fromBackingInt(@intCast(try r.tag())) };
@@ -138,8 +206,56 @@ pub fn delta(comptime Impl: type, parameters: []const u8, state: []const u8, sum
 
 fn bytesOutcome(bytes: []const u8) !Outcome([]const u8) {
     var r: bincode.Reader = .init(bytes);
-    if (try r.tag() == 1) return .{ .err = try contract.decodeError(&r) };
+    if (try r.tag() == 1) return .{ .err = try decodeError(&r) };
     return .{ .ok = try r.bytes() };
+}
+
+fn decodeError(r: *bincode.Reader) !ContractError {
+    return switch (try r.tag()) {
+        0 => .{ .deser = try r.bytes() },
+        1 => .invalid_update,
+        2 => .{ .invalid_update_with_info = try r.bytes() },
+        3 => .invalid_state,
+        4 => .invalid_delta,
+        5 => .{ .other = try r.bytes() },
+        else => error.UnknownContractError,
+    };
+}
+
+/// `Vec<UpdateData>`
+fn encodeUpdates(w: *bincode.Writer, updates: []const contract.Update) !void {
+    try w.int(u64, updates.len);
+    for (updates) |u| switch (u) {
+        .state => |s| {
+            try w.tag(0);
+            try w.bytes(s);
+        },
+        .delta => |d| {
+            try w.tag(1);
+            try w.bytes(d);
+        },
+        .state_and_delta => |x| {
+            try w.tag(2);
+            try w.bytes(x.state);
+            try w.bytes(x.delta);
+        },
+        .related_state => |x| {
+            try w.tag(3);
+            try w.raw(&x.related_to);
+            try w.bytes(x.state);
+        },
+        .related_delta => |x| {
+            try w.tag(4);
+            try w.raw(&x.related_to);
+            try w.bytes(x.delta);
+        },
+        .related_state_and_delta => |x| {
+            try w.tag(5);
+            try w.raw(&x.related_to);
+            try w.bytes(x.state);
+            try w.bytes(x.delta);
+        },
+    };
 }
 
 // ---- raw access (for wire-format tests) --------------------------------------
@@ -173,7 +289,6 @@ pub const raw = struct {
             .update_state => E.update_state(p, s, fill(third.?)),
             .summarize_state => E.summarize_state(p, s),
             .state_delta => E.get_state_delta(p, s, fill(third.?)),
-            .validate_delta => unreachable,
         };
         const r = abi.i64ToPtr(*const abi.ContractResult, res);
         if (r.kind != @backingInt(kind)) return error.WrongResultKind;

@@ -92,6 +92,15 @@ Returned errors become a `ContractError` on the node:
 
 Never use `freenet.random`, the clock, or anything that differs between peers
 in a contract. Same inputs must give the same output everywhere.
+`freenet-check-wasm` (run by `addTests`) rejects a contract that imports the
+node's randomness.
+
+## Safety checks
+
+Contracts are built with `.optimize = .safe` by default, so an out-of-bounds
+slice or an overflow on a strange input traps (the update is rejected) instead
+of producing a wrong state on some peers. Parse input defensively anyway:
+other peers' updates are untrusted.
 
 ## Example
 

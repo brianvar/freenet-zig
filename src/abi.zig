@@ -44,9 +44,10 @@ pub const DelegateResult = extern struct {
     _pad: u32 = 0,
 };
 
+/// `ContractInterfaceResult.kind`. (1 was `ValidateDelta`, which the node
+/// no longer calls.)
 pub const ResultKind = enum(i32) {
     validate_state = 0,
-    validate_delta = 1,
     update_state = 2,
     summarize_state = 3,
     state_delta = 4,

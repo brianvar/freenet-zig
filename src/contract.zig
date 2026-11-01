@@ -108,41 +108,6 @@ pub const Updates = struct {
     }
 };
 
-pub fn encodeUpdates(w: *bincode.Writer, updates: []const Update) Allocator.Error!void {
-    try w.int(u64, updates.len);
-    for (updates) |u| switch (u) {
-        .state => |s| {
-            try w.tag(0);
-            try w.bytes(s);
-        },
-        .delta => |d| {
-            try w.tag(1);
-            try w.bytes(d);
-        },
-        .state_and_delta => |x| {
-            try w.tag(2);
-            try w.bytes(x.state);
-            try w.bytes(x.delta);
-        },
-        .related_state => |x| {
-            try w.tag(3);
-            try w.raw(&x.related_to);
-            try w.bytes(x.state);
-        },
-        .related_delta => |x| {
-            try w.tag(4);
-            try w.raw(&x.related_to);
-            try w.bytes(x.delta);
-        },
-        .related_state_and_delta => |x| {
-            try w.tag(5);
-            try w.raw(&x.related_to);
-            try w.bytes(x.state);
-            try w.bytes(x.delta);
-        },
-    };
-}
-
 /// States of related contracts the node fetched for `validateState`
 /// (`RelatedContracts`: a map from id to optional state).
 pub const RelatedContracts = struct {
@@ -162,14 +127,6 @@ pub const RelatedContracts = struct {
         const entries = try gpa.alloc(Entry, @intCast(n));
         for (entries) |*e| e.* = .{ .id = try r.array(32), .state = try r.optionalBytes() };
         return .{ .entries = entries };
-    }
-
-    pub fn encode(rc: RelatedContracts, w: *bincode.Writer) Allocator.Error!void {
-        try w.int(u64, rc.entries.len);
-        for (rc.entries) |e| {
-            try w.raw(&e.id);
-            try w.optionalBytes(e.state);
-        }
     }
 };
 
@@ -292,9 +249,9 @@ fn encodeError(w: *bincode.Writer, c: *const Contract, err: anyerror, in_update:
 
 fn encodeErrorInner(w: *bincode.Writer, c: *const Contract, err: anyerror, in_update: bool) Allocator.Error!void {
     try w.tag(1); // Err
-    if (c.failure) |reason| {
+    if (err == error.ContractFailed) {
         try w.tag(if (in_update) 2 else 5);
-        try w.bytes(reason);
+        try w.bytes(c.failure orelse "ContractFailed");
         return;
     }
     switch (err) {
@@ -310,26 +267,4 @@ fn encodeErrorInner(w: *bincode.Writer, c: *const Contract, err: anyerror, in_up
             try w.bytes(@errorName(err));
         },
     }
-}
-
-/// A `ContractError` decoded (used by `freenet.testing`).
-pub const ContractError = union(enum) {
-    deser: []const u8,
-    invalid_update,
-    invalid_update_with_info: []const u8,
-    invalid_state,
-    invalid_delta,
-    other: []const u8,
-};
-
-pub fn decodeError(r: *bincode.Reader) !ContractError {
-    return switch (try r.tag()) {
-        0 => .{ .deser = try r.bytes() },
-        1 => .invalid_update,
-        2 => .{ .invalid_update_with_info = try r.bytes() },
-        3 => .invalid_state,
-        4 => .invalid_delta,
-        5 => .{ .other = try r.bytes() },
-        else => error.UnknownContractError,
-    };
 }

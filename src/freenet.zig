@@ -36,7 +36,7 @@ pub const log = host.log;
 pub const ContractInstanceId = types.ContractInstanceId;
 pub const DelegateKey = types.DelegateKey;
 
-/// The content-addressed web-app contract `addWebApp` uses by default.
+/// The signed-site web-app contract `addWebApp` uses.
 pub const WebContainer = @import("webcontainer.zig");
 
 test {

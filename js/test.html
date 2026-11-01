@@ -1,0 +1,256 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>freenet.js tests</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, monospace; margin: 2rem; }
+  .ok { color: #1a7f37; }
+  .fail { color: #cf222e; font-weight: bold; }
+  #summary { margin-top: 1rem; font-weight: bold; }
+</style>
+<h1>freenet.js tests</h1>
+<p>Open this file in a browser (no server, no Node.js). It loads <code>freenet.js</code>
+next to it and drives it with a fake WebSocket.</p>
+<pre id="out"></pre>
+<div id="summary">running…</div>
+
+<script src="freenet.js"></script>
+<script>
+(async () => {
+"use strict";
+
+// ---- a scripted fake node ------------------------------------------------------
+
+const RealWebSocket = window.WebSocket;
+const sockets = [];
+
+class FakeSocket {
+  static OPEN = 1;
+  constructor(url) { this.url = url; this.readyState = 0; this.sent = []; sockets.push(this); }
+  send(bytes) { this.sent.push(bytes); }
+  close() { if (this.readyState === 3) return; this.readyState = 3; setTimeout(() => this.onclose?.(), 0); }
+  // test controls
+  open() { this.readyState = 1; this.onopen?.(); }
+  drop() { this.readyState = 3; this.onclose?.(); }
+  reply(bytes) { this.onmessage?.({ data: bytes.buffer }); }
+}
+
+const URL_FOR_TESTS = "ws://node/v1/contract/command?encodingProtocol=native";
+const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
+const le32 = (v) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v, true); return b; };
+const cat = (...parts) => { const o = new Uint8Array(parts.reduce((n, p) => n + p.length, 0)); let i = 0; for (const p of parts) { o.set(p, i); i += p.length; } return o; };
+const OK = cat(le32(0), le32(3));               // Ok(HostResponse::Ok)
+const NODE_UNAVAILABLE = cat(le32(1), le32(4)); // Err(ErrorKind::NodeUnavailable)
+const hex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+
+const assert = {
+  equal(a, b, what = "") { if (a !== b) throw new Error(`${what} expected ${String(b)}, got ${String(a)}`); },
+  ok(v, what = "") { if (!v) throw new Error(`${what} expected a truthy value`); },
+  throws(fn, re) {
+    try { fn(); } catch (err) { if (re && !re.test(err.message)) throw new Error(`threw "${err.message}", wanted ${re}`); return; }
+    throw new Error("did not throw");
+  },
+  async rejects(promise, check) {
+    let err;
+    try { await promise; } catch (e) { err = e; }
+    if (!err) throw new Error("did not reject");
+    if (check instanceof RegExp ? !check.test(err.message) : check && !check(err)) throw new Error(`rejected with "${err.message}"`);
+  },
+};
+
+/** Fresh state for a test: the fake socket in place, no embedded delegates or contracts. */
+function fresh() {
+  sockets.length = 0;
+  window.WebSocket = FakeSocket;
+  FreenetClient.embedded = {};
+  FreenetClient.contracts = {};
+}
+
+async function connected(options = {}) {
+  const pending = FreenetClient.connect({ url: URL_FOR_TESTS, ...options });
+  await tick();
+  sockets.at(-1).open();
+  return pending;
+}
+
+// ---- tests ---------------------------------------------------------------------
+
+const tests = {
+  async "only FreenetClient becomes a global"() {
+    fresh();
+    for (const name of ["Writer", "Reader", "toBytes", "blake3", "FreenetError", "DelegateHandle", "ContractHandle"]) {
+      assert.equal(typeof window[name], "undefined", name);
+    }
+    // a page script may use those names: a top-level class would clash if they were global
+    let clash = null;
+    const onerror = (e) => { clash = e.message; e.preventDefault(); };
+    window.addEventListener("error", onerror);
+    const script = document.createElement("script");
+    script.textContent = "class Writer {} class Reader {} const toBytes = 1; let blake3;";
+    document.head.append(script);
+    window.removeEventListener("error", onerror);
+    assert.equal(clash, null, "page script clashed: " + clash);
+    assert.equal(typeof FreenetClient.Error, "function");
+  },
+
+  "pages get the id helpers from FreenetClient.util"() {
+    const { blake3, base58Encode, base58Decode, hexToBytes, bytesToHex, concatBytes } = FreenetClient.util;
+    assert.equal(bytesToHex(blake3(new Uint8Array(0))), "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262");
+    assert.equal(bytesToHex(base58Decode(base58Encode(hexToBytes("00ff10")))), "00ff10");
+    assert.equal(concatBytes(new Uint8Array([1]), new Uint8Array([2, 3])).length, 3);
+  },
+
+  async "a failed first connect does not keep reconnecting"() {
+    fresh();
+    const pending = FreenetClient.connect({ url: URL_FOR_TESTS });
+    await tick();
+    sockets[0].drop();
+    await assert.rejects(pending, /cannot connect/);
+    await tick(2100);
+    assert.equal(sockets.length, 1);
+  },
+
+  async "a lost connection reconnects"() {
+    fresh();
+    await connected();
+    sockets[0].drop();
+    await tick(2100);
+    assert.equal(sockets.length, 2);
+  },
+
+  async "a late reply after a timeout cannot answer the next request"() {
+    fresh();
+    const client = await connected({ reconnect: false });
+    const first = sockets[0];
+    await assert.rejects(client._request(new Uint8Array([1]), (r) => r.kind === "ok", 20), /timed out/);
+    const next = client._request(new Uint8Array([2]), (r) => r.kind === "ok", 1000);
+    await tick();
+    first.reply(OK); // the late answer to the first request
+    await assert.rejects(next, /not connected/);
+  },
+
+  async "a node error rejects the request in flight"() {
+    fresh();
+    const client = await connected();
+    const req = client._request(new Uint8Array([1]), (r) => r.kind === "ok");
+    await tick();
+    sockets[0].reply(NODE_UNAVAILABLE);
+    await assert.rejects(req, (err) => err instanceof FreenetClient.Error && err.kind === "NodeUnavailable");
+  },
+
+  async "concurrent delegate() calls register once"() {
+    fresh();
+    FreenetClient.embedded = { r: { wasm: "AA==", key: "11".repeat(32), codeHash: "22".repeat(32) } };
+    const client = await connected();
+    const a = client.delegate("r"), b = client.delegate("r");
+    await tick();
+    sockets[0].reply(OK);
+    assert.ok((await a) === (await b), "same handle");
+    assert.equal(sockets[0].sent.length, 1);
+  },
+
+  async "delegates are registered and messaged with their parameters"() {
+    fresh();
+    const params = "33".repeat(32);
+    FreenetClient.embedded = { r: { wasm: "AA==", key: "11".repeat(32), codeHash: "22".repeat(32), parameters: params } };
+    const client = await connected();
+    const pending = client.delegate("r");
+    await tick();
+    sockets[0].reply(OK);
+    const handle = await pending;
+    // RegisterDelegate carries them as Delegate.parameters: after 4 + 4 + 4 + 4 header bytes, a length-prefixed byte string
+    assert.equal(hex(sockets[0].sent[0].subarray(16, 16 + 8 + 32)), "2000000000000000" + params);
+    const sending = handle.send("hi");
+    await tick();
+    // ApplicationMessages: DelegateOp, ApplicationMessages, key, code hash, then params
+    assert.equal(hex(sockets[0].sent[1].subarray(8 + 64, 8 + 64 + 8 + 32)), "2000000000000000" + params);
+    sockets[0].reply(cat(le32(0), le32(1), new Uint8Array(32).fill(0x11), new Uint8Array(32).fill(0x22), new Uint8Array(8))); // DelegateResponse, no values
+    assert.equal((await sending).length, 0);
+  },
+
+  async "concurrent subscribe() calls send one Subscribe and both wait for it"() {
+    fresh();
+    const client = await connected();
+    const handle = client.contractAt(new Uint8Array(32).fill(5), new Uint8Array(32).fill(6));
+    let settled = 0;
+    const a = handle.subscribe(() => {}).then(() => settled++);
+    const b = handle.subscribe(() => {}).then(() => settled++);
+    await tick();
+    assert.equal(settled, 0);
+    // Ok(ContractResponse::SubscribeResponse { key, subscribed: true })
+    sockets[0].reply(cat(le32(0), le32(0), le32(4), new Uint8Array(32).fill(5), new Uint8Array(32).fill(6), [1]));
+    await Promise.all([a, b]);
+    assert.equal(sockets[0].sent.length, 1);
+  },
+
+  "contract ids are BLAKE3(code hash || parameters)"() {
+    fresh();
+    const client = new FreenetClient({ url: URL_FOR_TESTS });
+    // official BLAKE3 test vectors: input byte i is i % 251
+    const vectors = {
+      64: "4eed7141ea4a5cd4b788606bd23f46e212af9cacebacdc7d1f4c6dc7f2511b98",
+      65: "de1e5fa0be70df6d2be8fffd0e99ceaa8eb6e8c93a63f2d8d1c30ecb6b263dee",
+      1023: "10108970eeda3eb932baac1428c7a2163b0e924c9a9e25b35bba72b28f70bd11",
+      1024: "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7",
+      1025: "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444",
+      2049: "5f4d72f40d7a5f82b15ca2b2e44b1de3c2ef86c426c95c1af0b6879522563030",
+      3072: "b98cb0ff3623be03326b373de6b9095218513e64f1ee2edd2525c7ad1e5cffd2",
+      8193: "bab6c09cb8ce8cf459261398d2e7aef35700bf488116ceb94a36d0f5f1b7bc3b",
+      31744: "62b6960e1a44bcc1eb1a611a8d6235b6b4b78f32e7abc4fb4c6cdcce94895c47",
+    };
+    for (const [len, want] of Object.entries(vectors)) {
+      const input = Uint8Array.from({ length: Number(len) }, (_, i) => i % 251);
+      FreenetClient.contracts = { c: { wasm: "", codeHash: hex(input.subarray(0, 32)) } };
+      assert.equal(hex(client.contract("c", input.subarray(32)).id), want, `length ${len}`);
+    }
+  },
+
+  "ids are validated"() {
+    fresh();
+    const client = new FreenetClient({ url: URL_FOR_TESTS });
+    assert.throws(() => client.contractAt("abc"), /32 bytes/);
+    assert.throws(() => client.contractAt("0OIl"), /invalid base58/);
+    const id = client.contractAt(new Uint8Array(32).fill(9)).idString;
+    assert.equal(hex(client.contractAt(id).id), "09".repeat(32)); // base58 round trip
+    assert.throws(() => client.contract("missing"), /no embedded contract/);
+    FreenetClient.contracts = { c: { wasm: "", codeHash: "zz" } };
+    assert.throws(() => client.contract("c"), /invalid hex/);
+    FreenetClient.contracts = { c: { wasm: "", codeHash: "00".repeat(32) } };
+    assert.throws(() => client.contract("c", [1, 2]), /expected a string, Uint8Array or ArrayBuffer/);
+    client.contract("c", new ArrayBuffer(3)); // accepted
+  },
+
+  async "delegate failures keep the delegate's own message"() {
+    fresh();
+    const client = await connected();
+    const req = client._request(new Uint8Array([1]), () => false);
+    await tick();
+    const msg = new TextEncoder().encode("insufficient balance");
+    // Err(RequestError(DelegateError::ExecutionError(msg)))
+    sockets[0].reply(cat(le32(1), le32(8), le32(1), le32(1), new Uint8Array(new BigUint64Array([BigInt(msg.length)]).buffer), msg));
+    await assert.rejects(req, (err) => err.kind === "DelegateExecutionError" && err.message === "insufficient balance");
+  },
+};
+
+// ---- run -----------------------------------------------------------------------
+
+const out = document.getElementById("out");
+const warn = console.warn;
+console.warn = () => {}; // the client logs refusals it recovers from
+let failed = 0;
+for (const [name, fn] of Object.entries(tests)) {
+  const line = document.createElement("div");
+  try {
+    await Promise.race([fn(), new Promise((_, no) => setTimeout(() => no(new Error("took more than 10 s")), 10000))]);
+    line.className = "ok"; line.textContent = `ok   ${name}`;
+  } catch (err) { failed++; line.className = "fail"; line.textContent = `FAIL ${name}: ${err.message}`; }
+  out.append(line);
+}
+console.warn = warn;
+window.WebSocket = RealWebSocket;
+const summary = document.getElementById("summary");
+summary.textContent = failed ? `${failed} failed` : "all passed";
+summary.className = failed ? "fail" : "ok";
+document.title = failed ? "FAIL" : "PASS";
+window.__result = { failed, total: Object.keys(tests).length };
+})();
+</script>

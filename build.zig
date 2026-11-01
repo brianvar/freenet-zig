@@ -4,8 +4,13 @@
 //!     const freenet = @import("freenet");
 //!     const dep = b.dependencyFromBuildZig(freenet, .{});
 //!     const my_delegate = freenet.addDelegate(b, dep, .{ .name = "random", .root_source_file = b.path("src/delegate.zig") });
-//!     const app = freenet.addWebApp(b, dep, .{ .page = b.path("web/index.html"), .delegates = &.{my_delegate} });
+//!     const app = freenet.addWebApp(b, dep, .{
+//!         .page = b.path("web/index.html"),
+//!         .signing_key = "my-app", // the name given to `fdev website init my-app`
+//!         .delegates = &.{my_delegate},
+//!     });
 //!     b.getInstallStep().dependOn(app.install);
+//!     freenet.addTests(b, dep, b.step("test", "Run tests"), .{ .delegates = &.{my_delegate} });
 //!
 //! See docs/build.md.
 
@@ -24,7 +29,7 @@ pub fn build(b: *Build) void {
 
     // Library tests (native) + the built-in web container checked as Wasm.
     const test_step = b.step("test", "Run the library's tests");
-    for ([_][]const u8{ "src/freenet.zig", "tools/pack.zig", "tools/check_wasm.zig" }) |path| {
+    for ([_][]const u8{ "src/freenet.zig", "tools/check_wasm.zig" }) |path| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(path),
             .target = target,
@@ -32,7 +37,7 @@ pub fn build(b: *Build) void {
         }) });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
-    const webcontainer = wasmCompile(b, mod, "web_container", b.path("src/webcontainer_main.zig"), .small, &@import("src/abi.zig").contract_exports);
+    const webcontainer = wasmCompile(b, mod, "web_container", b.path("src/webcontainer_main.zig"), .safe, &@import("src/abi.zig").contract_exports);
     const run_check = b.addRunArtifact(check);
     run_check.addArg("--contract");
     run_check.addArtifactArg2(webcontainer, .{});
@@ -65,6 +70,8 @@ fn wasmCompile(
             .root_source_file = root,
             .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
             .optimize = optimize,
+            // The node refuses Wasm with debug sections, which `.safe` would keep.
+            .strip = true,
             .imports = &.{.{ .name = "freenet", .module = freenet_module }},
         }),
     });
@@ -82,7 +89,9 @@ pub const ModuleOptions = struct {
     /// `client.delegate("<name>")`.
     name: []const u8,
     root_source_file: Build.LazyPath,
-    optimize: std.lang.Optimize = .small,
+    /// `.safe` keeps bounds and overflow checks, which matter for code that
+    /// handles input from other peers. `.small` drops them for size.
+    optimize: std.lang.Optimize = .safe,
 };
 
 /// Compiles a delegate to Wasm. The root file imports `freenet` and calls
@@ -103,6 +112,15 @@ pub const WebAppOptions = struct {
     /// The page, packed as `index.html`. Put `<script src="freenet.js"></script>`
     /// in it to get the client and the embedded delegates.
     page: Build.LazyPath,
+    /// The *name* of the publisher's signing key, as given to
+    /// `fdev website init <name>` (see docs/web-apps.md). It's looked up in
+    /// the building user's freenet config, so the same build file works on every
+    /// machine that has the key. It decides the app's id and who may publish
+    /// updates.
+    signing_key: []const u8,
+    /// Release number; each release must be higher than the one before.
+    /// Default: the Unix time of the build.
+    version: ?u32 = null,
     /// Delegates (from `addDelegate`) to embed, by artifact name:
     /// `client.delegate("<name>")`.
     delegates: []const *Build.Step.Compile = &.{},
@@ -118,22 +136,32 @@ pub const WebAppOptions = struct {
 pub const WebApp = struct {
     /// The web-app contract (the built-in content-addressed web container).
     contract: *Build.Step.Compile,
-    /// Output directory: state.bin, params.bin, web.tar.xz, site.txt.
+    /// Output directory: web_container.wasm, state.bin, params.bin (the
+    /// public key), web.tar.xz, site.txt.
     output: Build.LazyPath,
-    /// Installs `output` to `<prefix>/<install_dir>` and the Wasm modules to `<prefix>/bin`.
+    /// Installs `output` to `<prefix>/<install_dir>` and the delegates and
+    /// contracts to `<prefix>/bin`.
     install: *Build.Step,
 };
 
 /// Packs a page and its delegates into a publishable web app using the
 /// built-in web-container contract.
 pub fn addWebApp(b: *Build, dep: *Build.Dependency, options: WebAppOptions) WebApp {
-    const contract = wasmCompile(b, dep.module("freenet"), "web_container", dep.path("src/webcontainer_main.zig"), .small, &@import("src/abi.zig").contract_exports);
+    const contract = wasmCompile(b, dep.module("freenet"), "web_container", dep.path("src/webcontainer_main.zig"), .safe, &@import("src/abi.zig").contract_exports);
 
     const run = b.addRunArtifact(dep.artifact("freenet-pack"));
     run.addArg("--web-contract");
     run.addArtifactArg2(contract, .{});
     run.addArg("--client");
     run.addFileArg(dep.path("js/freenet.js"));
+    run.addArgs(&.{ "--key", options.signing_key });
+    // The key is read from outside the build, so a cached result could be
+    // for another key; always pack again (every build is a new release).
+    run.has_side_effects = true;
+    if (options.version) |v| {
+        run.addArg("--version");
+        run.addArg(b.fmt("{d}", .{v}));
+    }
     run.addArg("--file");
     run.addFileArg2(options.page, .{ .prefix = "index.html=" });
     for (options.files) |f| {
@@ -153,7 +181,6 @@ pub fn addWebApp(b: *Build, dep: *Build.Dependency, options: WebAppOptions) WebA
 
     const install = b.step(b.fmt("install-{s}", .{options.install_dir}), "Install the packed web app");
     install.dependOn(&b.addInstallDirectory(.{ .source_dir = output, .install_dir = .prefix, .install_subdir = options.install_dir }).step);
-    install.dependOn(&b.addInstallArtifact(contract, .{}).step);
     for (options.delegates) |d| install.dependOn(&b.addInstallArtifact(d, .{}).step);
     for (options.contracts) |c| install.dependOn(&b.addInstallArtifact(c, .{}).step);
 
@@ -170,9 +197,8 @@ pub const TestOptions = struct {
 };
 
 /// Native unit tests for your delegates/contracts plus ABI checks of the
-/// compiled Wasm. Add the returned step to your `test` step.
-pub fn addTests(b: *Build, dep: *Build.Dependency, options: TestOptions) *Build.Step {
-    const step = b.step("freenet-tests", "Freenet unit tests and Wasm ABI checks");
+/// compiled Wasm, added to `step` (usually your `test` step).
+pub fn addTests(b: *Build, dep: *Build.Dependency, step: *Build.Step, options: TestOptions) void {
     for (options.sources) |src| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = src,
@@ -189,5 +215,4 @@ pub fn addTests(b: *Build, dep: *Build.Dependency, options: TestOptions) *Build.
         for (options.contracts) |c| check.addArtifactArg2(c, .{});
         step.dependOn(&check.step);
     }
-    return step;
 }

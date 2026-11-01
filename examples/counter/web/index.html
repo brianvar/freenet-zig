@@ -32,18 +32,11 @@
 const $ = (id) => document.getElementById(id);
 const setStatus = (text, error = false) => { $("status").textContent = text; $("status").classList.toggle("error", error); };
 
-// A random visitor id, kept across reloads when the browser allows it.
-const myId = (() => {
-  try { const saved = localStorage.getItem("visitor"); if (saved) return saved; } catch {}
-  const id = Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, "0")).join("");
-  try { localStorage.setItem("visitor", id); } catch {}
-  return id;
-})();
-
 // "counter-v1\n<id>:<count>\n..." -> Map(id -> count)
 const parse = (text) => new Map((text ?? "").split("\n").slice(1).filter(Boolean)
   .map((line) => { const [id, n] = line.split(":"); return [id, Number(n)]; }));
 
+let myId = null;
 let counts = new Map();
 function render() {
   const total = [...counts.values()].reduce((a, b) => a + b, 0);
@@ -54,6 +47,9 @@ function render() {
 (async () => {
   try {
     const client = await FreenetClient.connect();
+    // This visitor's id, kept by the visitor delegate on their own node
+    // (pages run sandboxed, without localStorage).
+    [myId] = await (await client.delegate("visitor")).sendText("id");
     const counter = client.contract("counter");          // the app's one counter (no parameters)
 
     let state = await counter.getText();

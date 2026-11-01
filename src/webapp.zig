@@ -6,16 +6,29 @@
 //!
 //! The archive must contain `index.html` at its root. This module packs and
 //! parses that layout; `freenet-pack` and `addWebApp` use it at build time.
+//!
+//! The built-in web container (`webcontainer.zig`) stores *signed* sites, in
+//! the same format as freenet-core's `fdev website`: the metadata is CBOR
+//! `{ "version": u32, "signature": bytes(64) }`, where the signature is an
+//! Ed25519 signature over `version (u32 BE) ‖ archive`, made by the key whose
+//! public half is the contract's parameters.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Crc32 = std.hash.Crc32;
+const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const File = struct {
     /// Path inside the archive, `/`-separated (e.g. `index.html`, `img/a.png`).
     name: []const u8,
     data: []const u8,
 };
+
+/// The largest contract state the node stores (freenet-core `MAX_STATE_SIZE`).
+pub const max_state_size = 50 * 1024 * 1024;
+
+/// The node refuses metadata larger than this.
+pub const max_metadata_size = 1024;
 
 /// `[u64 BE len][metadata][u64 BE len][archive]`
 pub fn buildState(gpa: Allocator, metadata: []const u8, archive: []const u8) Allocator.Error![]u8 {
@@ -33,7 +46,7 @@ pub const ParsedState = struct { metadata: []const u8, archive: []const u8 };
 pub fn parseState(state: []const u8) error{InvalidState}!ParsedState {
     if (state.len < 8) return error.InvalidState;
     const meta_len = std.mem.readInt(u64, state[0..8], .big);
-    if (meta_len > state.len - 8) return error.InvalidState;
+    if (meta_len > max_metadata_size or meta_len > state.len - 8) return error.InvalidState;
     const rest = state[8 + @as(usize, @intCast(meta_len)) ..];
     if (rest.len < 8) return error.InvalidState;
     const web_len = std.mem.readInt(u64, rest[0..8], .big);
@@ -48,6 +61,159 @@ pub fn tar(gpa: Allocator, files: []const File) ![]u8 {
     for (files) |f| try tw.writeFileBytes(f.name, f.data, .{ .mode = 0o644, .mtime = 0 });
     try tw.finishPedantically();
     return out.toOwnedSlice();
+}
+
+// ---- signed sites ------------------------------------------------------------
+
+pub const Metadata = struct {
+    /// Strictly increases with every release; 0 is invalid.
+    version: u32,
+    signature: [Ed25519.Signature.encoded_length]u8,
+};
+
+/// CBOR `{ "version": <uint>, "signature": <bytes(64)> }`.
+pub fn encodeMetadata(gpa: Allocator, m: Metadata) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(gpa, 0xa2); // map(2)
+    try out.append(gpa, 0x67); // text(7)
+    try out.appendSlice(gpa, "version");
+    var uint_buf: [5]u8 = undefined;
+    try out.appendSlice(gpa, cborUint(&uint_buf, m.version));
+    try out.append(gpa, 0x69); // text(9)
+    try out.appendSlice(gpa, "signature");
+    try out.appendSlice(gpa, &.{ 0x58, 0x40 }); // bytes(64)
+    try out.appendSlice(gpa, &m.signature);
+    return out.toOwnedSlice(gpa);
+}
+
+/// `v` as a CBOR unsigned integer (shortest form), written into `buf`. This
+/// is also how the web container writes its sync summary.
+pub fn cborUint(buf: *[5]u8, v: u32) []const u8 {
+    if (v < 24) {
+        buf[0] = @intCast(v);
+        return buf[0..1];
+    }
+    if (v <= 0xff) {
+        buf[0] = 0x18;
+        buf[1] = @intCast(v);
+        return buf[0..2];
+    }
+    if (v <= 0xffff) {
+        buf[0] = 0x19;
+        std.mem.writeInt(u16, buf[1..3], @intCast(v), .big);
+        return buf[0..3];
+    }
+    buf[0] = 0x1a;
+    std.mem.writeInt(u32, buf[1..5], v, .big);
+    return buf[0..5];
+}
+
+const CborHead = struct { major: u8, arg: u64 };
+
+/// Reads one CBOR item header (definite lengths only) at `pos.*`.
+fn cborHead(b: []const u8, pos: *usize) error{InvalidState}!CborHead {
+    if (pos.* >= b.len) return error.InvalidState;
+    const first = b[pos.*];
+    pos.* += 1;
+    const info = first & 0x1f;
+    if (info < 24) return .{ .major = first >> 5, .arg = info };
+    const width: usize = switch (info) {
+        24 => 1,
+        25 => 2,
+        26 => 4,
+        27 => 8,
+        else => return error.InvalidState, // indefinite lengths and reserved values
+    };
+    if (b.len - pos.* < width) return error.InvalidState;
+    var arg: u64 = 0;
+    for (b[pos.*..][0..width]) |byte| arg = (arg << 8) | byte;
+    pos.* += width;
+    return .{ .major = first >> 5, .arg = arg };
+}
+
+/// A CBOR unsigned integer that fits in a u32, and nothing after it.
+pub fn parseCborUint(b: []const u8) error{InvalidState}!u32 {
+    var pos: usize = 0;
+    const h = try cborHead(b, &pos);
+    if (h.major != 0 or h.arg > std.math.maxInt(u32) or pos != b.len) return error.InvalidState;
+    return @intCast(h.arg);
+}
+
+/// Parses the metadata. Accepts the signature as a CBOR byte string (what
+/// `encodeMetadata` writes) or as an array of 64 small integers (what
+/// `fdev website` writes), and the two keys in either order.
+pub fn parseMetadata(b: []const u8) error{InvalidState}!Metadata {
+    var pos: usize = 0;
+    const map = try cborHead(b, &pos);
+    if (map.major != 5 or map.arg != 2) return error.InvalidState;
+    var version: ?u32 = null;
+    var signature: ?[64]u8 = null;
+    for (0..2) |_| {
+        const key_head = try cborHead(b, &pos);
+        if (key_head.major != 3 or key_head.arg > b.len - pos) return error.InvalidState;
+        const key = b[pos..][0..@intCast(key_head.arg)];
+        pos += key.len;
+        if (std.mem.eql(u8, key, "version") and version == null) {
+            const v = try cborHead(b, &pos);
+            if (v.major != 0 or v.arg > std.math.maxInt(u32)) return error.InvalidState;
+            version = @as(u32, @intCast(v.arg));
+        } else if (std.mem.eql(u8, key, "signature") and signature == null) {
+            const v = try cborHead(b, &pos);
+            if (v.arg != 64) return error.InvalidState;
+            var sig: [64]u8 = undefined;
+            switch (v.major) {
+                2 => { // byte string
+                    if (b.len - pos < 64) return error.InvalidState;
+                    sig = b[pos..][0..64].*;
+                    pos += 64;
+                },
+                4 => for (&sig) |*byte| { // array of unsigned integers
+                    const e = try cborHead(b, &pos);
+                    if (e.major != 0 or e.arg > 0xff) return error.InvalidState;
+                    byte.* = @intCast(e.arg);
+                },
+                else => return error.InvalidState,
+            }
+            signature = sig;
+        } else return error.InvalidState; // unknown or repeated key
+    }
+    if (pos != b.len) return error.InvalidState;
+    return .{ .version = version.?, .signature = signature.? };
+}
+
+/// The release number of a state (without checking its signature).
+pub fn stateVersion(state: []const u8) error{InvalidState}!u32 {
+    return (try parseMetadata((try parseState(state)).metadata)).version;
+}
+
+pub const VerifyError = error{ InvalidState, BadSignature };
+
+/// Checks that `state` has the web-app layout, a version above 0, and a valid
+/// signature by `public_key` over `version ‖ archive`.
+pub fn verifyState(public_key: [32]u8, state: []const u8) VerifyError!Metadata {
+    const parsed = try parseState(state);
+    const meta = try parseMetadata(parsed.metadata);
+    if (meta.version == 0) return error.InvalidState;
+    const key = Ed25519.PublicKey.fromBytes(public_key) catch return error.InvalidState;
+    var v = Ed25519.Signature.fromBytes(meta.signature).verifier(key) catch return error.BadSignature;
+    var version_be: [4]u8 = undefined;
+    std.mem.writeInt(u32, &version_be, meta.version, .big);
+    v.update(&version_be);
+    v.update(parsed.archive);
+    v.verifyStrict() catch return error.BadSignature;
+    return meta;
+}
+
+/// Signs `archive` as release `version` and returns the complete state.
+pub fn signState(gpa: Allocator, key_pair: Ed25519.KeyPair, version: u32, archive: []const u8) ![]u8 {
+    const message = try gpa.alloc(u8, 4 + archive.len);
+    defer gpa.free(message);
+    std.mem.writeInt(u32, message[0..4], version, .big);
+    @memcpy(message[4..], archive);
+    const signature = try key_pair.sign(message, null);
+    const metadata = try encodeMetadata(gpa, .{ .version = version, .signature = signature.toBytes() });
+    defer gpa.free(metadata);
+    return buildState(gpa, metadata, archive);
 }
 
 /// Wraps `data` in a valid .xz stream without compressing it: one block of
@@ -127,12 +293,6 @@ fn appendVarint(out: *std.ArrayList(u8), gpa: Allocator, value: u64) Allocator.E
     try out.append(gpa, @intCast(v));
 }
 
-/// tar + xz + state layout in one call (no metadata).
-pub fn pack(gpa: Allocator, files: []const File) ![]u8 {
-    const archive = try xzStore(gpa, try tar(gpa, files));
-    return buildState(gpa, "", archive);
-}
-
 // ---- tests ----------------------------------------------------------------
 
 const testing = std.testing;
@@ -158,12 +318,12 @@ test "xzStore round-trips through std's xz decoder" {
     }
 }
 
-test "pack -> parseState -> xz -> tar gives the files back" {
+test "tar -> xz -> buildState -> parseState gives the files back" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const files = [_]File{ .{ .name = "index.html", .data = "<h1>hi</h1>" }, .{ .name = "css/site.css", .data = "h1{}" } };
-    const state = try pack(a, &files);
+    const state = try buildState(a, "", try xzStore(a, try tar(a, &files)));
 
     const parsed = try parseState(state);
     try testing.expectEqual(@as(usize, 0), parsed.metadata.len);
@@ -183,10 +343,91 @@ test "pack -> parseState -> xz -> tar gives the files back" {
     try testing.expect((try it.next()) == null);
 }
 
+/// Made with Node's Ed25519 (RFC 8032, so deterministic) from seed 7×32,
+/// version 1780000000 and archive "hello archive", and accepted by
+/// freenet-core's own website contract.
+const vector_public_key = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";
+const vector_state = "000000000000005aa26776657273696f6e1a6a18a500697369676e6174757265584036a70520775fd7a914ea7b7ce3bbb44a8d36a00f00996f7a563835f5af979d224384ede57ea22b2abfb62c060c7f6b18cd1d869876f3177aebba300c7fd25a0a000000000000000d68656c6c6f2061726368697665";
+/// The same release as `fdev website` writes it (signature as an array).
+const vector_state_fdev = "0000000000000091a26776657273696f6e1a6a18a500697369676e61747572659840183618a70518201877185f18d718a91418ea187b187c18e318bb18b4184a188d183618a00f001899186f187a18561838183518f518af1897189d18221843188418ed18e5187e18a2182b182a18bf18b6182c060c187f186b181818cd181d18861898187618f317187a18eb18ba18300c187f18d2185a0a000000000000000d68656c6c6f2061726368697665";
+
+fn unhex(comptime hex: []const u8) [hex.len / 2]u8 {
+    @setEvalBranchQuota(100_000);
+    var out: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
+    return out;
+}
+
+fn testKeyPair() !Ed25519.KeyPair {
+    return Ed25519.KeyPair.generateDeterministic(@splat(7));
+}
+
+test "signState writes exactly the bytes freenet-core's contract accepts" {
+    const kp = try testKeyPair();
+    try testing.expectEqualSlices(u8, &unhex(vector_public_key), &kp.public_key.toBytes());
+    const state = try signState(testing.allocator, kp, 1_780_000_000, "hello archive");
+    defer testing.allocator.free(state);
+    try testing.expectEqualSlices(u8, &unhex(vector_state), state);
+}
+
+test "verifyState accepts both metadata encodings" {
+    const pk = unhex(vector_public_key);
+    const mine = try verifyState(pk, &unhex(vector_state));
+    const fdev = try verifyState(pk, &unhex(vector_state_fdev));
+    try testing.expectEqual(@as(u32, 1_780_000_000), mine.version);
+    try testing.expectEqualSlices(u8, &mine.signature, &fdev.signature);
+}
+
+test "verifyState rejects tampering, other keys and version 0" {
+    const pk = unhex(vector_public_key);
+    var state = unhex(vector_state);
+    state[state.len - 1] ^= 1; // archive changed
+    try testing.expectError(error.BadSignature, verifyState(pk, &state));
+
+    var other = unhex(vector_state);
+    other[40] ^= 1; // a byte of the signature (inside the metadata)
+    try testing.expectError(error.BadSignature, verifyState(pk, &other));
+
+    const other_key = (try Ed25519.KeyPair.generateDeterministic(@splat(8))).public_key.toBytes();
+    try testing.expectError(error.BadSignature, verifyState(other_key, &unhex(vector_state)));
+
+    const kp = try testKeyPair();
+    const v0 = try signState(testing.allocator, kp, 0, "hello archive");
+    defer testing.allocator.free(v0);
+    try testing.expectError(error.InvalidState, verifyState(pk, v0));
+}
+
+test "parseMetadata rejects malformed CBOR" {
+    const good = (try parseState(&unhex(vector_state))).metadata;
+    _ = try parseMetadata(good);
+    try testing.expectError(error.InvalidState, parseMetadata(good[0 .. good.len - 1]));
+    const trailing = try std.mem.concat(testing.allocator, u8, &.{ good, "x" });
+    defer testing.allocator.free(trailing);
+    try testing.expectError(error.InvalidState, parseMetadata(trailing));
+    try testing.expectError(error.InvalidState, parseMetadata(""));
+    const one_key = [_]u8{ 0xa1, 0x67 } ++ "version".* ++ [_]u8{0x01};
+    try testing.expectError(error.InvalidState, parseMetadata(&one_key));
+    try testing.expectError(error.InvalidState, parseMetadata(&.{ 0xbf, 0xff })); // indefinite map
+}
+
+test "cbor uints round trip in their shortest form" {
+    var buf: [5]u8 = undefined;
+    for ([_]u32{ 0, 23, 24, 255, 256, 65535, 65536, std.math.maxInt(u32) }) |v| {
+        const encoded = cborUint(&buf, v);
+        try testing.expectEqual(v, try parseCborUint(encoded));
+    }
+    try testing.expectEqualSlices(u8, &.{ 0x18, 200 }, cborUint(&buf, 200)); // ciborium: 18c8
+    try testing.expectError(error.InvalidState, parseCborUint(&.{ 0x1b, 0, 0, 0, 1, 0, 0, 0, 0 })); // > u32
+    try testing.expectError(error.InvalidState, parseCborUint(&.{ 0x01, 0x02 })); // trailing byte
+}
+
 test "parseState rejects malformed layouts" {
     try testing.expectError(error.InvalidState, parseState(""));
     try testing.expectError(error.InvalidState, parseState(&@as([7]u8, @splat(0))));
     var bad: [17]u8 = @splat(0);
     std.mem.writeInt(u64, bad[8..16], 5, .big); // claims 5 archive bytes, has 1
     try testing.expectError(error.InvalidState, parseState(&bad));
+    var big_meta: [8]u8 = undefined;
+    std.mem.writeInt(u64, &big_meta, max_metadata_size + 1, .big);
+    try testing.expectError(error.InvalidState, parseState(&big_meta));
 }
