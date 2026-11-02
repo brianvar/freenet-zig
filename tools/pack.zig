@@ -14,8 +14,8 @@
 //!   and each machine has its own copy. A value with a `/` or `\` or ending in
 //!   `.toml` or `.key` is taken as a file path instead (for CI), either an
 //!   `fdev` file or just the 32-byte Ed25519 seed as 64 hex characters.
-//! * The client plus the embedded delegates (Wasm + key + parameters) and
-//!   contracts (Wasm + code hash) become the archive file `freenet.js`, which
+//! * The client plus the embedded delegates (Wasm + key + parameters),
+//!   contracts (Wasm + code hash) and the app's id become the archive file `freenet.js`, which
 //!   pages load with `<script src="freenet.js"></script>`.
 //! * A delegate's parameters are the web app's contract id, so that it can
 //!   check `d.origin` (`Delegate.requireApp`). The id is
@@ -122,6 +122,7 @@ pub fn main(init: std.process.Init) !void {
         try key_lines.writer.print("contract code {s}: {s}\n", .{ c.name, freenet.types.encodeBase58(&b58, &code_hash) });
     }
     try cw.writeAll("\n};\n");
+    try cw.print("FreenetClient.appId = \"{s}\";\n", .{&std.fmt.bytesToHex(app_id, .lower)});
 
     // The archive: the given files plus freenet.js.
     var packed_files: std.ArrayList(freenet.webapp.File) = .empty;

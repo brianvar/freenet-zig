@@ -78,6 +78,12 @@ below); `zig build test` does not.
   `d.requireApp()` fails the call unless the node-attested `d.origin` is that app.
   It fails closed. Another site can register the same delegate code with different
   parameters, but that is a different delegate with its own empty secrets.
+- **`client.delegateAt(codeHash)` reaches a delegate the page doesn't embed**
+  (key computed from the code hash and, by default, `FreenetClient.appId`, which
+  freenet-pack writes). Why: a new build of a delegate starts with empty secrets,
+  but the earlier one is still on the node and accepts the same app, so a page
+  carries its secrets over by asking it (docs/delegates.md, "Upgrades"). No
+  registration, since the page doesn't have the old code.
 - **The signing key is a name, not a path.** `addWebApp(.signing_key = "pixie")` is
   looked up where `fdev` keeps it (`<config dir>/freenet/website-keys/<name>.toml`,
   `signing_key = "<hex seed>"`), so build files don't hold machine paths and the key

@@ -9,6 +9,7 @@
 //   // delegates: private logic on the user's node
 //   const random = await client.delegate("random");
 //   const [n] = await random.sendText("random");
+//   const earlier = client.delegateAt(codeHashOfAnEarlierBuild); // already on the node
 //
 //   // contracts: shared state on the network
 //   const room = client.contract("chat", ownerKeyBytes);   // parameters
@@ -27,6 +28,8 @@
 class FreenetClient {
   /** Filled in by freenet-pack: { name: { wasm: base64, key: hex, codeHash: hex, parameters: hex } } */
   static embedded = {};
+  /** Filled in by freenet-pack: this web app's contract id (hex), the parameters of its delegates. */
+  static appId = null;
   /** Filled in by freenet-pack: { name: { wasm: base64, codeHash: hex } } */
   static contracts = {};
 
@@ -77,6 +80,23 @@ class FreenetClient {
       pending.catch(() => this._registered.delete(name)); // allow a retry
     }
     return pending;
+  }
+
+  /**
+   * A handle to a delegate this page doesn't embed, by its code hash (hex,
+   * base58 or bytes) and parameters (Uint8Array or string; default: this
+   * app's id, which freenet-pack gives every delegate it embeds). Its key is
+   * BLAKE3(code hash ‖ parameters). Nothing is registered, so it answers
+   * only if the node already has it, such as this app's delegate from an
+   * earlier build; otherwise `send` rejects with a FreenetError.
+   */
+  delegateAt(codeHash, parameters) {
+    if (parameters === undefined && FreenetClient.appId == null)
+      throw new TypeError("delegateAt needs parameters: this page has no app id (not packed by freenet-pack)");
+    const hash = bytes32(codeHash, "code hash");
+    const params = parameters === undefined ? hexToBytes(FreenetClient.appId) : toBytes(parameters);
+    const key = blake3(concatBytes(hash, params));
+    return new DelegateHandle(this, `at ${base58Encode(key)}`, { wasm: null, key, codeHash: hash, parameters: params });
   }
 
   // ---- contracts ----

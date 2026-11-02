@@ -88,6 +88,21 @@ Sends one `ApplicationMessage` and resolves with the payloads of the
 delegate's replies. Rejects with the delegate's error message if it failed (see
 [delegates.md](delegates.md#errors)).
 
+```js
+const earlier = client.delegateAt(codeHash, parameters?); // a delegate already on the node
+```
+
+Returns a handle, synchronously, to a delegate the page doesn't embed: its key
+is BLAKE3(code hash ‖ parameters), computed in the browser. `codeHash` is hex,
+base58 or 32 bytes; `parameters` (a `Uint8Array` or string) defaults to this
+app's id, `FreenetClient.appId` (hex, written by `freenet-pack`), the
+parameters of every delegate the app embeds. Nothing is registered (the page
+doesn't have the code), so it answers only if the node already has that
+delegate; otherwise `send` rejects with a `FreenetClient.Error`. Its use is
+upgrades: a delegate from an earlier build of this app, still on the node,
+keeps its secrets and still passes `requireApp`, so the new build can read them
+and carry them over (see [delegates.md](delegates.md#upgrades)).
+
 ### Contracts
 
 ```js

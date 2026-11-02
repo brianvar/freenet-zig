@@ -96,6 +96,25 @@ empty secrets.
 Delegates not built through `addWebApp` have no app id; check `d.origin`
 yourself.
 
+## Upgrades
+
+A delegate's key is BLAKE3(code hash ‖ parameters), so any change to its Wasm
+(your code, this library, the Zig version) makes a new delegate with empty
+secrets. The old one is still on the users' nodes with its secrets, and its
+parameters are the app's id, which stays the same across builds as long as
+the signing key and the web container do. So a new build can carry the
+secrets over: keep the code hash of each released build of the delegate, and
+in the page ask each earlier one, by `client.delegateAt(codeHash)`, for what
+it holds (with messages it already answers), then hand that to the new one.
+The earlier delegate's `requireApp` lets the new page in, since it is the same
+app.
+
+Record in the new delegate which earlier builds are done, and only once
+everything has arrived; treat an error or no answer as "try again next
+time", never as "empty" (a node that doesn't have the delegate answers with an
+error). Keep the messages the earlier builds answer, and their encoding,
+working in your page for as long as users may have those builds.
+
 ## Errors
 
 Any error returned from `handle` fails the call. The app receives
