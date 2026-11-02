@@ -28,6 +28,7 @@ const gpa = abi.allocator;
 /// context, instance id set. Call at the start of each test.
 pub fn reset() void {
     host.native.reset();
+    last_prompts = &.{};
 }
 
 /// Replace the random source (for example to force edge cases).
@@ -68,11 +69,25 @@ pub const SendOptions = struct {
 };
 
 /// What a delegate call returned: its reply payloads, or the error message
-/// it failed with.
+/// it failed with. Prompts it asked for are in `prompts()`.
 pub const Result = union(enum) {
     ok: []const []const u8,
     err: []const u8,
 };
+
+var last_prompts: []const delegate.UserInputRequest = &.{};
+
+/// The prompts (`d.requestUserInput`) the last successful delegate call asked
+/// for, in order; empty after a failed call. Answer one with `respond`.
+pub fn prompts() []const delegate.UserInputRequest {
+    return last_prompts;
+}
+
+/// Answer a prompt the way the node does: a `UserResponse` with `request_id`
+/// and the chosen response's bytes (`""` for refused or timed out).
+pub fn respond(comptime Impl: type, request_id: u32, response: []const u8, opts: SendOptions) !Result {
+    return send(Impl, .{ .user_response = .{ .request_id = request_id, .response = response } }, opts);
+}
 
 /// Send one inbound message to delegate `Impl`.
 pub fn send(comptime Impl: type, msg: delegate.Inbound, opts: SendOptions) !Result {
@@ -119,24 +134,42 @@ fn encodeInbound(w: *bincode.Writer, msg: delegate.Inbound) !void {
             try w.bytes(app.context);
             try w.boolean(app.processed);
         },
+        .user_response => |u| {
+            try w.tag(1);
+            try w.int(u32, u.request_id);
+            try w.bytes(u.response);
+            try w.bytes(u.context);
+        },
         .unsupported => |u| try w.raw(u.raw),
     }
 }
 
 /// Decodes `Result<Vec<OutboundDelegateMsg>, DelegateError>` as the library
-/// writes it (only `ApplicationMessage` replies).
+/// writes it (`ApplicationMessage` replies and `RequestUserInput` prompts).
 fn decodeResult(bytes: []const u8) !Result {
     var r: bincode.Reader = .init(bytes);
+    last_prompts = &.{};
     switch (try r.tag()) {
         0 => {
             var replies: std.ArrayList([]const u8) = .empty;
-            for (0..@as(usize, @intCast(try r.int(u64)))) |_| {
-                if (try r.tag() != 0) return error.UnsupportedOutbound;
-                try replies.append(gpa, try r.bytes());
-                _ = try r.bytes(); // context
-                _ = try r.boolean(); // processed
-            }
+            var asked: std.ArrayList(delegate.UserInputRequest) = .empty;
+            for (0..@as(usize, @intCast(try r.int(u64)))) |_| switch (try r.tag()) {
+                0 => {
+                    try replies.append(gpa, try r.bytes());
+                    _ = try r.bytes(); // context
+                    _ = try r.boolean(); // processed
+                },
+                1 => {
+                    const id = try r.int(u32);
+                    const message = try r.bytes();
+                    const labels = try gpa.alloc([]const u8, @intCast(try r.int(u64)));
+                    for (labels) |*l| l.* = try r.bytes();
+                    try asked.append(gpa, .{ .request_id = id, .message = message, .responses = labels });
+                },
+                else => return error.UnsupportedOutbound,
+            };
             if (r.remaining() != 0) return error.TrailingBytes;
+            last_prompts = asked.items;
             return .{ .ok = replies.items };
         },
         1 => {

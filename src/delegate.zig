@@ -11,7 +11,7 @@
 //! pub fn handle(d: *freenet.Delegate, msg: freenet.Inbound) !void {
 //!     switch (msg) {
 //!         .application => |app| try d.reply(app.payload), // echo
-//!         .unsupported => {},
+//!         .user_response, .unsupported => {},
 //!     }
 //! }
 //! ```
@@ -45,9 +45,35 @@ pub const ApplicationMessage = struct {
     processed: bool = false,
 };
 
+/// `UserResponse`: the user's answer to a prompt this delegate asked for
+/// (`Delegate.requestUserInput`).
+///
+/// Not proof that the user answered: a web app can send this message itself,
+/// with any id and any bytes (nodes don't refuse it from clients yet). Accept
+/// it only if `request_id` matches a prompt you saved before asking, with an
+/// id the app can't know (random), and clear that saved prompt whatever the
+/// answer. An empty `response` means refused, timed out, or no prompt shown.
+pub const UserResponse = struct {
+    request_id: u32,
+    /// The bytes of the chosen response (the button's label), or empty.
+    response: []const u8,
+    /// Always empty from the node; the delegate context lives on through
+    /// `d.context()`.
+    context: []const u8 = "",
+};
+
+/// A prompt the node shows the user (`RequestUserInput`), queued by
+/// `Delegate.requestUserInput`.
+pub const UserInputRequest = struct {
+    request_id: u32,
+    message: []const u8,
+    responses: []const []const u8,
+};
+
 /// An inbound message (`InboundDelegateMsg`).
 pub const Inbound = union(enum) {
     application: ApplicationMessage,
+    user_response: UserResponse,
     /// Any other variant (contract responses, notifications, lifecycle
     /// events, ...). Not decoded by this library yet; `raw` is the whole
     /// bincode message, `tag` its variant index.
@@ -66,6 +92,8 @@ pub const Delegate = struct {
 
     /// Reply payloads so far, sent to the app when `handle` returns.
     replies: std.ArrayList([]const u8) = .empty,
+    /// Prompts asked for so far, sent to the node after the replies.
+    prompts: std.ArrayList(UserInputRequest) = .empty,
     failure: ?[]const u8 = null,
 
     /// Reply to the app with `payload`.
@@ -76,6 +104,34 @@ pub const Delegate = struct {
     /// Reply with formatted text.
     pub fn replyFmt(d: *Delegate, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
         try d.reply(try d.allocator.print(fmt, args));
+    }
+
+    /// The most responses a prompt may offer, and the longest response (in
+    /// bytes): the node shows no more and cuts longer labels.
+    pub const max_responses = 10;
+    pub const max_response_len = 64;
+    /// The longest message (in bytes) the node shows in full; it cuts longer
+    /// ones at 2048 characters.
+    pub const max_message_len = 2048;
+
+    /// Ask the node to show the user a prompt: `message` (UTF-8 text) and one
+    /// button per response, whose bytes are its label. The node shows it
+    /// outside every app's page, waits (60 s on current nodes), and then
+    /// calls this delegate again with a `.user_response` carrying
+    /// `request_id` and the chosen response's bytes (empty if refused or
+    /// timed out). Replies made in either call go to the app's original
+    /// request. While the prompt is open the node holds back other messages
+    /// to this delegate.
+    ///
+    /// Save what the prompt is for (and `request_id`) in a secret before
+    /// returning: the answer arrives in a new call. Use a random id and see
+    /// `UserResponse` for why. Put the safe choice first: a node that answers
+    /// without asking (test prompters) picks the first response.
+    pub fn requestUserInput(d: *Delegate, request_id: u32, message: []const u8, responses: []const []const u8) error{ OutOfMemory, DelegateFailed }!void {
+        if (responses.len == 0 or responses.len > max_responses) return d.fail("a prompt needs 1 to 10 responses");
+        for (responses) |r| if (r.len == 0 or r.len > max_response_len) return d.fail("prompt responses are 1 to 64 bytes");
+        if (message.len > max_message_len) return d.fail("a prompt message is at most 2048 bytes");
+        try d.prompts.append(d.allocator, .{ .request_id = request_id, .message = message, .responses = responses });
     }
 
     /// Replace the delegate context (scratch state within one message batch).
@@ -174,7 +230,7 @@ pub fn Exports(comptime Impl: type) type {
                 const failed = @as(anyerror, err) == error.DelegateFailed;
                 return encodeError(.other, if (failed) (d.failure orelse "DelegateFailed") else @errorName(err));
             };
-            return encodeOk(d.replies.items);
+            return encodeOk(d.replies.items, d.prompts.items);
         }
     };
 }
@@ -197,30 +253,44 @@ pub fn decodeOrigin(bytes: []const u8) Origin {
 
 pub fn decodeInbound(bytes: []const u8) bincode.Error!Inbound {
     var r: bincode.Reader = .init(bytes);
-    const t = try r.tag();
-    if (t != 0) return .{ .unsupported = .{ .tag = t, .raw = bytes } };
-    return .{ .application = .{
-        .payload = try r.bytes(),
-        .context = try r.bytes(),
-        .processed = try r.boolean(),
-    } };
+    return switch (try r.tag()) {
+        0 => .{ .application = .{
+            .payload = try r.bytes(),
+            .context = try r.bytes(),
+            .processed = try r.boolean(),
+        } },
+        1 => .{ .user_response = .{
+            .request_id = try r.int(u32),
+            .response = try r.bytes(),
+            .context = try r.bytes(),
+        } },
+        else => |t| .{ .unsupported = .{ .tag = t, .raw = bytes } },
+    };
 }
 
-/// `Ok(Vec<OutboundDelegateMsg>)`, one `ApplicationMessage` per reply.
-fn encodeOk(replies: []const []const u8) []const u8 {
+/// `Ok(Vec<OutboundDelegateMsg>)`: one `ApplicationMessage` per reply, then
+/// one `RequestUserInput` per prompt.
+fn encodeOk(replies: []const []const u8, prompts: []const UserInputRequest) []const u8 {
     var w: bincode.Writer = .init(abi.allocator);
-    encodeReplies(&w, replies) catch @trap();
+    encodeOutbound(&w, replies, prompts) catch @trap();
     return w.items();
 }
 
-fn encodeReplies(w: *bincode.Writer, replies: []const []const u8) Allocator.Error!void {
+fn encodeOutbound(w: *bincode.Writer, replies: []const []const u8, prompts: []const UserInputRequest) Allocator.Error!void {
     try w.tag(0); // Ok
-    try w.int(u64, replies.len);
+    try w.int(u64, replies.len + prompts.len);
     for (replies) |payload| {
         try w.tag(0); // ApplicationMessage
         try w.bytes(payload);
         try w.bytes(""); // context (the node clears it anyway)
         try w.boolean(true); // processed: deliver to the app
+    }
+    for (prompts) |p| {
+        try w.tag(1); // RequestUserInput
+        try w.int(u32, p.request_id);
+        try w.bytes(p.message); // NotificationMessage
+        try w.int(u64, p.responses.len);
+        for (p.responses) |r| try w.bytes(r); // ClientResponse
     }
 }
 

@@ -38,7 +38,7 @@ comptime {
 pub fn handle(d: *freenet.Delegate, msg: freenet.Inbound) !void {
     const app = switch (msg) {
         .application => |a| a,
-        .unsupported => return,
+        else => return, // prompt answers, lifecycle events, ...
     };
     if (std.mem.eql(u8, app.payload, "random")) {
         try d.replyFmt("{d}", .{try freenet.random.intRange(u32, 1, 1000)});

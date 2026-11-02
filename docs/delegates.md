@@ -36,6 +36,7 @@ messages; use [secrets](#secrets) for anything persistent.
 ```zig
 pub const Inbound = union(enum) {
     application: ApplicationMessage, // from a web app (or another client)
+    user_response: UserResponse,     // an answer to a prompt, see below
     unsupported: struct { tag: u32, raw: []const u8 },
 };
 
@@ -47,6 +48,7 @@ pub const ApplicationMessage = struct {
 ```
 
 `payload` is whatever the page sent: text, JSON, or your own binary format.
+`user_response` is covered under [Asking the user](#asking-the-user).
 `unsupported` covers the node's other message kinds (contract responses,
 notifications) that the library doesn't decode yet. Handle it with `=> {}` or
 `=> return`, and the node gets an empty reply. (Lifecycle and wake-up events
@@ -62,6 +64,51 @@ try d.replyFmt("{d} items", .{n});
 
 Each reply becomes an `ApplicationMessage` delivered back to the app. A call
 can reply zero, one or several times; the page receives all of them, in order.
+
+## Asking the user
+
+A delegate can ask the node to show the user a prompt, drawn by the node's
+own page outside every app's sandboxed page, so an app can't fake it or
+hide it:
+
+```zig
+const id = try freenet.random.int(u32);
+try d.secrets().set("pending", ...); // what the prompt is for, and `id`
+try d.requestUserInput(id, "Send 30 to 6b34…f93d?", &.{ "Cancel", "Send 30" });
+```
+
+The node shows the message and one button per response (a response's bytes
+are its label), waits for a click (60 s on current nodes), then calls the
+delegate again with `.user_response`:
+
+```zig
+pub const UserResponse = struct {
+    request_id: u32,
+    response: []const u8, // the chosen response's bytes; empty: refused or timed out
+    context: []const u8,  // always empty; use d.context() or secrets
+};
+```
+
+Replies from both calls go back to the app's original request, so the page
+gets one answer. While the prompt is open the node holds back other messages
+to this delegate (they wait, up to the timeout). The page needs a longer
+timeout for such a message: `handle.send(bytes, { timeoutMs: 90000 })`.
+
+**A `.user_response` is not proof the user clicked.** Current nodes let a web
+app send `UserResponse` messages itself, with any id and any bytes. So:
+
+- Use a random `request_id` (the app never sees the prompt, so it can't
+  learn it), and save the pending action with its id in a secret *before*
+  returning the prompt.
+- Accept an answer only if its id matches the saved one and its bytes equal
+  the approving label. Remove the saved action on *every* answer, matching
+  or not, so a guess costs the attacker the request.
+- Put the safe choice first: test prompters answer with the first response.
+
+Limits: 1 to 10 responses of 1 to 64 bytes, and a message of at most 2048
+bytes. `requestUserInput` fails beyond them, because the node would cut the
+text silently. The message is shown as UTF-8 text (or a JSON string, if it
+parses as one); control characters other than newlines are dropped.
 
 ## Origin: who's asking
 

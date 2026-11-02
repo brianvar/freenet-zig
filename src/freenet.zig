@@ -17,6 +17,8 @@ pub const exportDelegate = delegate.exportDelegate;
 pub const Delegate = delegate.Delegate;
 pub const Inbound = delegate.Inbound;
 pub const Origin = delegate.Origin;
+pub const UserResponse = delegate.UserResponse;
+pub const UserInputRequest = delegate.UserInputRequest;
 
 // ---- contracts ----
 pub const exportContract = contract.exportContract;

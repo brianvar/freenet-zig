@@ -283,8 +283,14 @@ class DelegateHandle {
     Object.assign(this, { client, name, wasm, key, codeHash, parameters });
   }
 
-  /** Send a payload (Uint8Array or string); resolves to the reply payloads (Uint8Array[]). */
-  async send(payload) {
+  /**
+   * Send a payload (Uint8Array or string); resolves to the reply payloads (Uint8Array[]).
+   * `timeoutMs` (default 30 s) is how long to wait for the answer. Raise it
+   * for a message the delegate answers only after a prompt to the user
+   * (`requestUserInput`): the node waits up to 60 s for the user. Requests
+   * go out one at a time, so everything else this client sends waits too.
+   */
+  async send(payload, { timeoutMs = 30000 } = {}) {
     // ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { key, params, inbound })
     const req = new Writer()
       .u32(0).u32(0)            // DelegateOp, ApplicationMessages
@@ -296,13 +302,13 @@ class DelegateHandle {
       .bytes(new Uint8Array(0)) // context
       .u8(0)                    // processed = false
       .finish();
-    const res = await this.client._request(req, (r) => r.kind === "delegate" && equalBytes(r.key, this.key));
+    const res = await this.client._request(req, (r) => r.kind === "delegate" && equalBytes(r.key, this.key), timeoutMs);
     return res.payloads;
   }
 
   /** Like send, but decodes replies as UTF-8 text. */
-  async sendText(text) {
-    return (await this.send(text)).map(bytesToText);
+  async sendText(text, options) {
+    return (await this.send(text, options)).map(bytesToText);
   }
 }
 

@@ -61,7 +61,7 @@ comptime {
 pub fn handle(d: *freenet.Delegate, msg: freenet.Inbound) !void {
     switch (msg) {
         .application => |app| try d.replyFmt("hello, {s}!", .{app.payload}),
-        .unsupported => {},
+        else => {},
     }
 }
 ```

@@ -167,6 +167,22 @@ const tests = {
     assert.equal((await sending).length, 0);
   },
 
+  async "send takes a timeout (for messages answered after a prompt)"() {
+    fresh();
+    FreenetClient.embedded = { r: { wasm: "AA==", key: "11".repeat(32), codeHash: "22".repeat(32) } };
+    const client = await connected({ reconnect: false });
+    const pending = client.delegate("r");
+    await tick();
+    sockets[0].reply(OK);
+    const handle = await pending;
+    const slow = handle.send("hi", { timeoutMs: 200 });
+    let done = false;
+    slow.catch(() => {}).finally(() => { done = true; });
+    await tick(50);
+    assert.equal(done, false, "still waiting before its timeout");
+    await assert.rejects(slow, /timed out/);
+  },
+
   async "concurrent subscribe() calls send one Subscribe and both wait for it"() {
     fresh();
     const client = await connected();

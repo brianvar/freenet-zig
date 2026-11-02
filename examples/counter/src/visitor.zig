@@ -19,7 +19,7 @@ const secret_key = "visitor-id";
 pub fn handle(d: *freenet.Delegate, msg: freenet.Inbound) !void {
     const app = switch (msg) {
         .application => |a| a,
-        .unsupported => return,
+        else => return, // prompt answers, lifecycle events, ...
     };
     try d.requireApp();
     if (!std.mem.eql(u8, app.payload, "id")) return d.fail("unknown request (send \"id\")");

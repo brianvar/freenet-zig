@@ -101,7 +101,9 @@ bincode 1.x legacy config:
 
 **Delegate inbound:** `InboundDelegateMsg`. Tag 0 is
 `ApplicationMessage { payload: Vec<u8>, context: Bytes, processed: bool }`;
-other tags are passed through as `.unsupported`. The variant list is
+tag 1 is `UserResponse(UserInputResponse { request_id: u32, response:
+ClientResponse (Bytes), context: Bytes })`; other tags are passed through as
+`.unsupported`. The variant list is
 append-only: 1 UserResponse, 2-6 contract responses/notifications,
 7 DelegateMessage, 8 UnsubscribeContractResponse, 9 WakeupFired, 10 Lifecycle.
 
@@ -109,8 +111,10 @@ append-only: 1 UserResponse, 2-6 contract responses/notifications,
 1 `Delegate(DelegateKey { key: [u8;32], code_hash: [u8;32] })`.
 
 **Delegate result:** `Result<Vec<OutboundDelegateMsg>, DelegateError>`.
-The library emits only outbound 0, `ApplicationMessage` (sent with
-`processed: true`); `setContext` uses the `ctx_write` host function rather
+The library emits outbound 0, `ApplicationMessage` (sent with
+`processed: true`), one per reply, then outbound 1, `RequestUserInput(
+UserInputRequest { request_id: u32, message: NotificationMessage (Bytes),
+responses: Vec<ClientResponse (Bytes)> })`, one per prompt; `setContext` uses the `ctx_write` host function rather
 than outbound 2, `ContextUpdated`, which freenet-stdlib marks for removal.
 `DelegateError` is 0 `Deser(String)` (malformed input), 1 `Other(String)`.
 

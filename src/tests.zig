@@ -47,7 +47,7 @@ const Echo = struct {
                 if (std.mem.eql(u8, app.payload, "origin")) return d.replyFmt("{s}", .{@tagName(d.origin)});
                 try d.reply(app.payload);
             },
-            .unsupported => {},
+            .user_response, .unsupported => {},
         }
     }
 };
@@ -86,7 +86,7 @@ const Guarded = struct {
                 try d.requireApp();
                 try d.reply("secret");
             },
-            .unsupported => {},
+            .user_response, .unsupported => {},
         }
     }
 };
@@ -123,11 +123,83 @@ test "delegate: origins" {
     try testing.expectEqualSlices(u8, &(le32(0) ++ le64(1) ++ le32(0) ++ vec("delegate") ++ vec("") ++ [_]u8{1}), out);
 }
 
+const Prompter = struct {
+    pub fn handle(d: *freenet.Delegate, msg: freenet.Inbound) !void {
+        switch (msg) {
+            .application => |app| {
+                if (std.mem.eql(u8, app.payload, "too many")) {
+                    return d.requestUserInput(1, "?", &@as([11][]const u8, @splat("x")));
+                }
+                if (std.mem.eql(u8, app.payload, "empty label")) return d.requestUserInput(1, "?", &.{""});
+                if (std.mem.eql(u8, app.payload, "long label")) return d.requestUserInput(1, "?", &.{&@as([65]u8, @splat('x'))});
+                if (std.mem.eql(u8, app.payload, "long message")) return d.requestUserInput(1, &@as([2049]u8, @splat('x')), &.{"ok"});
+                try d.reply("asked");
+                try d.requestUserInput(0x01020304, "Pay 5?", &.{ "Cancel", "Pay" });
+            },
+            .user_response => |u| try d.replyFmt("{x}:{s}:{d}", .{ u.request_id, u.response, u.context.len }),
+            .unsupported => {},
+        }
+    }
+};
+
+test "delegate: RequestUserInput bytes (after the replies)" {
+    t.reset();
+    const out = t.raw.callDelegate(Prompter, "", &web_origin, &appMsg("ask"));
+    const expected = le32(0) ++ le64(2) ++ // Ok, two messages
+        le32(0) ++ vec("asked") ++ vec("") ++ [_]u8{1} ++ // ApplicationMessage, processed
+        le32(1) ++ le32(0x01020304) ++ // RequestUserInput { request_id
+        vec("Pay 5?") ++ // message: NotificationMessage (serde Bytes)
+        le64(2) ++ vec("Cancel") ++ vec("Pay"); // responses: Vec<ClientResponse> }
+    try testing.expectEqualSlices(u8, &expected, out);
+}
+
+test "delegate: UserResponse (tag 1) reaches handle as .user_response" {
+    t.reset();
+    // InboundDelegateMsg::UserResponse(UserInputResponse { request_id, response, context })
+    const in = le32(1) ++ le32(0xabcdef01) ++ vec("Pay") ++ vec("cx");
+    const out = t.raw.callDelegate(Prompter, "", &web_origin, &in);
+    try testing.expectEqualSlices(u8, &(le32(0) ++ le64(1) ++ le32(0) ++ vec("abcdef01:Pay:2") ++ vec("") ++ [_]u8{1}), out);
+    // truncated: a Deser error, not a guess
+    try testing.expectEqualSlices(u8, &(le32(1) ++ le32(0) ++ vec("EndOfStream")), t.raw.callDelegate(Prompter, "", &web_origin, &(le32(1) ++ [_]u8{ 1, 2 })));
+}
+
+test "delegate: testing harness shows prompts and answers them" {
+    t.reset();
+    try testing.expectEqualStrings("asked", (try t.ask(Prompter, "ask", .{}))[0]);
+    const asked = t.prompts();
+    try testing.expectEqual(1, asked.len);
+    try testing.expectEqual(0x01020304, asked[0].request_id);
+    try testing.expectEqualStrings("Pay 5?", asked[0].message);
+    try testing.expectEqual(2, asked[0].responses.len);
+    try testing.expectEqualStrings("Pay", asked[0].responses[1]);
+
+    const answer = try t.respond(Prompter, asked[0].request_id, "Pay", .{});
+    try testing.expectEqualStrings("1020304:Pay:0", answer.ok[0]);
+    try testing.expectEqual(0, t.prompts().len);
+    const refused = try t.respond(Prompter, 9, "", .{});
+    try testing.expectEqualStrings("9::0", refused.ok[0]);
+}
+
+test "delegate: requestUserInput refuses what the node would cut" {
+    t.reset();
+    const cases = [_][2][]const u8{
+        .{ "too many", "a prompt needs 1 to 10 responses" },
+        .{ "empty label", "prompt responses are 1 to 64 bytes" },
+        .{ "long label", "prompt responses are 1 to 64 bytes" },
+        .{ "long message", "a prompt message is at most 2048 bytes" },
+    };
+    for (cases) |c| {
+        const res = try t.send(Prompter, .{ .application = .{ .payload = c[0] } }, .{});
+        try testing.expectEqualStrings(c[1], res.err);
+        try testing.expectEqual(0, t.prompts().len);
+    }
+}
+
 const Vault = struct {
     pub fn handle(d: *freenet.Delegate, msg: freenet.Inbound) !void {
         const app = switch (msg) {
             .application => |a| a,
-            .unsupported => return,
+            .user_response, .unsupported => return,
         };
         const s = d.secrets();
         if (std.mem.startsWith(u8, app.payload, "set ")) {

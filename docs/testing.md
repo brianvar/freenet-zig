@@ -37,11 +37,13 @@ test "random replies are in range" {
 | `setLog(fn ([]const u8) void)` | capture log output |
 | `putSecret(key, value)` / `secret(key)` | seed or inspect the secret store |
 | `context()` | the delegate context as the last call left it |
+| `prompts() []const UserInputRequest` | the prompts (`d.requestUserInput`) the last successful call asked for: `request_id`, `message`, `responses` |
+| `respond(Impl, request_id, response, opts) !Result` | answer a prompt as the node does: a `UserResponse` with the chosen response's bytes (`""` for refused or timed out) |
 
 `opts` is `SendOptions{ .origin = ..., .parameters = ... }`. The default origin
 is a web app whose id is 32 bytes of `7`, and the default parameters are empty.
 A delegate that calls `d.requireApp()` needs the parameters to match, as
-`freenet-pack` sets them: `.{ .parameters = &([_]u8{7} ** 32) }`.
+`freenet-pack` sets them: `.{ .parameters = &@as([32]u8, @splat(7)) }`.
 
 ### Forcing edge cases
 
