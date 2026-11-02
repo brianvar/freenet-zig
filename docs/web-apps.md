@@ -87,6 +87,17 @@ const texts   = await d.sendText("hello");     // string[]
 Sends one `ApplicationMessage` and resolves with the payloads of the
 delegate's replies. Rejects with the delegate's error message if it failed (see
 [delegates.md](delegates.md#errors)).
+`send(payload, { timeoutMs })` waits longer than the default 30 s, for a
+message the delegate answers only after a prompt to the user.
+
+**A prompt the node didn't show.** A node in local mode (`freenet local`)
+never shows a delegate's prompt (`requestUserInput`); it hands it back with
+the reply. `send` then rejects with a `FreenetClient.Error` of kind
+`"PromptNotShown"`, with `prompts` (`[{ requestId, message, labels }]`) and
+any `payloads`. The page can answer one itself with
+`d.respond(requestId, label)`, which resolves like `send`. On such a node
+the page sees the id, so the prompt protects nothing there: show the
+message to the person and answer only with their choice.
 
 ```js
 const earlier = client.delegateAt(codeHash, parameters?); // a delegate already on the node

@@ -105,6 +105,13 @@ app send `UserResponse` messages itself, with any id and any bytes. So:
   or not, so a guess costs the attacker the request.
 - Put the safe choice first: test prompters answer with the first response.
 
+**Only network nodes prompt.** A node in local mode (`freenet local`, as of
+0.2.154) skips prompts: it returns the `RequestUserInput` to the app with the
+reply, id and labels included, and never calls the delegate back. The app
+can then answer it itself (freenet.js: `PromptNotShown`, `respond`), so on
+such a node a prompt is only as trustworthy as the page. The delegate can't
+tell the two kinds of node apart.
+
 Limits: 1 to 10 responses of 1 to 64 bytes, and a message of at most 2048
 bytes. `requestUserInput` fails beyond them, because the node would cut the
 text silently. The message is shown as UTF-8 text (or a JSON string, if it

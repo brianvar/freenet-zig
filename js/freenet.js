@@ -291,18 +291,42 @@ class DelegateHandle {
    * go out one at a time, so everything else this client sends waits too.
    */
   async send(payload, { timeoutMs = 30000 } = {}) {
-    // ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { key, params, inbound })
+    // InboundDelegateMsg::ApplicationMessage { payload, context, processed: false }
+    const inbound = new Writer().u32(0).bytes(toBytes(payload)).bytes(new Uint8Array(0)).u8(0).finish();
+    return this._send(inbound, timeoutMs);
+  }
+
+  /**
+   * Answer a prompt the node didn't show (see `PromptNotShown` below): a
+   * `UserResponse` with its `requestId` and the chosen label (or "" for
+   * no). Resolves to the delegate's replies, like `send`. Only for nodes
+   * that hand prompts to the page (local mode): the delegate can't tell
+   * this answer from a person's, so ask the person first.
+   */
+  async respond(requestId, label, { timeoutMs = 30000 } = {}) {
+    // InboundDelegateMsg::UserResponse(UserInputResponse { request_id, response, context })
+    const inbound = new Writer().u32(1).u32(requestId).bytes(toBytes(label)).bytes(new Uint8Array(0)).finish();
+    return this._send(inbound, timeoutMs);
+  }
+
+  async _send(inbound, timeoutMs) {
+    // ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { key, params, inbound: [one] })
     const req = new Writer()
       .u32(0).u32(0)            // DelegateOp, ApplicationMessages
       .raw(this.key).raw(this.codeHash)
       .bytes(this.parameters)
-      .u64(1)                   // inbound: one message
-      .u32(0)                   // InboundDelegateMsg::ApplicationMessage
-      .bytes(toBytes(payload))
-      .bytes(new Uint8Array(0)) // context
-      .u8(0)                    // processed = false
+      .u64(1)
+      .raw(inbound)
       .finish();
     const res = await this.client._request(req, (r) => r.kind === "delegate" && equalBytes(r.key, this.key), timeoutMs);
+    // A network node shows a delegate's prompt itself and answers once the
+    // user has; a node that can't (local mode) hands the prompt back here.
+    if (res.prompts.length) {
+      throw new FreenetError({
+        kind: "PromptNotShown", prompts: res.prompts, payloads: res.payloads,
+        message: "This Freenet node didn't show the delegate's prompt (a node in local mode can't)",
+      });
+    }
     return res.payloads;
   }
 
@@ -440,13 +464,19 @@ function parseHostResponse(buf) {
     case 0: return parseContractResponse(r); // HostResponse::ContractResponse
     case 1: { // HostResponse::DelegateResponse { key: DelegateKey, values: Vec<OutboundDelegateMsg> }
       const key = r.raw(32).slice(); r.raw(32);
-      const payloads = [];
+      const payloads = [], prompts = [];
       for (let i = 0, n = r.u64(); i < n; i++) {
-        if (r.u32() !== 0) break; // only ApplicationMessage carries a reply payload
-        const payload = r.bytes(); r.bytes(); r.u8();
-        payloads.push(payload.slice());
+        const tag = r.u32();
+        if (tag === 0) { // ApplicationMessage { payload, context, processed }: a reply
+          const payload = r.bytes(); r.bytes(); r.u8();
+          payloads.push(payload.slice());
+        } else if (tag === 1) { // RequestUserInput { request_id, message, responses }: a prompt the node didn't show
+          const requestId = r.u32(), message = r.text(), labels = [];
+          for (let j = 0, m = r.u64(); j < m; j++) labels.push(r.text());
+          prompts.push({ requestId, message, labels });
+        } else break; // nothing else is meant for the client
       }
-      return { kind: "delegate", key, payloads };
+      return { kind: "delegate", key, payloads, prompts };
     }
     case 3: return { kind: "ok" }; // HostResponse::Ok
     case 4: return { kind: "chunk", streamId: r.u32(), index: r.u32(), total: r.u32(), data: r.bytes() };

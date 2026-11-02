@@ -183,6 +183,32 @@ const tests = {
     await assert.rejects(slow, /timed out/);
   },
 
+  async "a prompt the node hands back (local mode) rejects send, and respond answers it"() {
+    fresh();
+    FreenetClient.embedded = { r: { wasm: "AA==", key: "11".repeat(32), codeHash: "22".repeat(32) } };
+    const client = await connected();
+    const pending = client.delegate("r");
+    await tick();
+    sockets[0].reply(OK);
+    const handle = await pending;
+    const u64 = (v) => cat(le32(v), le32(0));
+    const bytes = (t) => { const b = new TextEncoder().encode(t); return cat(u64(b.length), b); };
+    const head = cat(le32(0), le32(1), new Uint8Array(32).fill(0x11), new Uint8Array(32).fill(0x22)); // DelegateResponse { key }
+    const asking = handle.send("pay");
+    await tick();
+    // values: [RequestUserInput { request_id: 42, message, responses: ["Cancel", "Pay"] }]
+    sockets[0].reply(cat(head, u64(1), le32(1), le32(42), bytes("Pay 5?"), u64(2), bytes("Cancel"), bytes("Pay")));
+    await assert.rejects(asking, (err) => err instanceof FreenetClient.Error && err.kind === "PromptNotShown" &&
+      err.prompts.length === 1 && err.prompts[0].requestId === 42 && err.prompts[0].message === "Pay 5?" && err.prompts[0].labels[1] === "Pay");
+
+    const answering = handle.respond(42, "Pay");
+    await tick();
+    // ApplicationMessages { key, code hash, params: [], inbound: [UserResponse { 42, "Pay", context: [] }] }
+    assert.equal(hex(sockets[0].sent[2].subarray(8 + 64)), hex(cat(u64(0), u64(1), le32(1), le32(42), bytes("Pay"), u64(0))));
+    sockets[0].reply(cat(head, u64(1), le32(0), bytes("signed"), u64(0), new Uint8Array([1])));
+    assert.equal(new TextDecoder().decode((await answering)[0]), "signed");
+  },
+
   async "concurrent subscribe() calls send one Subscribe and both wait for it"() {
     fresh();
     const client = await connected();
