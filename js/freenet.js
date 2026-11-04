@@ -348,7 +348,9 @@ class ContractHandle {
 
   /**
    * Create the contract with an initial state (string or bytes). Only works
-   * for embedded contracts (it needs the code). Options: subscribe.
+   * for embedded contracts (it needs the code). Options: subscribe. If the
+   * node already has the contract (another client put it first), it merges
+   * the state in and answers with an UpdateResponse instead: that counts too.
    */
   async put(state, { subscribe = false } = {}) {
     if (!this._wasm) throw new Error("put needs the contract code: use client.contract(name, ...) with an embedded contract");
@@ -365,7 +367,7 @@ class ContractHandle {
       .u8(subscribe ? 1 : 0)       // subscribe
       .u8(0)                       // blocking_subscribe
       .finish();
-    await this.client._request(req, (r) => r.kind === "put" && equalBytes(r.key.id, this.id));
+    await this.client._request(req, (r) => (r.kind === "put" || r.kind === "updated") && equalBytes(r.key.id, this.id));
     return this;
   }
 
