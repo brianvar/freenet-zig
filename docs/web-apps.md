@@ -177,7 +177,10 @@ global.
   the request waiting for a reply.
 - **Large responses** (over 512 KiB) are reassembled transparently.
 - **Reconnecting** re-registers delegates and renews subscriptions. Changes
-  made while disconnected are not replayed; call `get()` if you need them.
+  made while disconnected are not replayed; call `get()` if you need them. A
+  request made while the client reconnects waits for the new connection (up to
+  its timeout) instead of failing; one in flight when the connection drops
+  rejects with `"connection closed"`.
 - **Errors.** Refusals from the node, such as a contract rejecting an update,
   reject with a `FreenetClient.Error` whose `kind` names the node's error
   (`"MissingContract"`, `"Update"`, `"DelegateExecutionError"`, ...), with
@@ -188,6 +191,14 @@ global.
 - **Sandbox.** Pages run in an iframe without `allow-same-origin`, so
   `localStorage`, cookies and IndexedDB are unavailable. Keep per-user data in a
   delegate's secrets (`examples/counter` keeps its visitor id that way).
+- **Links.** The node injects a click handler into the page that hands every
+  same-site link to its shell page, which closes the page's WebSockets and
+  loads the link into the iframe. For a link that only changes the hash
+  (`href="#/profile"`, hash routing) the iframe doesn't reload, so the page
+  keeps running with its connection closed. Mark such links
+  `data-freenet-no-intercept` (the node leaves those to the browser), or
+  mark them as they're clicked with a capturing `click` listener on `window`,
+  which runs before the node's on `document` (Beehive's `web/app.js` does).
 
 ```js
 client.close();

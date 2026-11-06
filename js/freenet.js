@@ -57,6 +57,7 @@ class FreenetClient {
     this._streams = new Map();       // stream id -> chunks of a large response
     this._everOpened = false;
     this._closing = false;
+    this._openWaiters = new Set();   // requests waiting for a reconnect: { resolve, reject }
   }
 
   static defaultUrl() {
@@ -129,6 +130,8 @@ class FreenetClient {
 
   close() {
     this._closing = true;
+    for (const w of this._openWaiters) w.reject(new Error("not connected"));
+    this._openWaiters.clear();
     this.ws?.close();
   }
 
@@ -144,6 +147,12 @@ class FreenetClient {
       ws.onopen = async () => {
         opened = true;
         this._everOpened = true;
+        // Requests that waited for this reconnect go first; re-registering
+        // queues behind them (it would wait for them anyway).
+        if (this.ws === ws) {
+          for (const w of this._openWaiters) w.resolve();
+          this._openWaiters.clear();
+        }
         // After a reconnect: register delegates and renew subscriptions again.
         // A failure is logged, not fatal; if the connection drops meanwhile,
         // onclose takes over.
@@ -222,24 +231,46 @@ class FreenetClient {
   // request is sent only after the previous one was answered or failed. A
   // timed-out request may still be answered later, which would then look
   // like the answer to the next one, so a timeout drops the connection (and
-  // reconnects, if enabled) instead of carrying on.
+  // reconnects, if enabled) instead of carrying on. A request made while the
+  // client reconnects waits for the new connection, up to its timeout.
   _request(bytes, expects, timeoutMs = 30000) {
-    const run = () => new Promise((resolve, reject) => {
+    const send = () => new Promise((resolve, reject) => {
       const ws = this.ws;
       if (!ws || ws.readyState !== WebSocket.OPEN) return reject(new Error("not connected"));
       const entry = { resolve, reject, expects };
       entry.timer = setTimeout(() => {
         if (this._inflight !== entry) return;
         this._inflight = null;
+        console.warn(`freenet.js: the node didn't answer within ${timeoutMs / 1000} s; reconnecting`);
         reject(new Error("timed out waiting for the node"));
         ws.close();
       }, timeoutMs);
       this._inflight = entry;
       ws.send(bytes);
     });
+    const run = async () => {
+      if (!this._isOpen() && this._everOpened && this.reconnect && !this._closing) await this._reopened(timeoutMs);
+      return send();
+    };
     const result = this._queue.then(run, run);
     this._queue = result.catch(() => {});
     return result;
+  }
+
+  _isOpen() {
+    return !!this.ws && this.ws.readyState === WebSocket.OPEN;
+  }
+
+  // Resolves when a reconnect opens the socket; rejects after `timeoutMs`.
+  _reopened(timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        resolve: () => { clearTimeout(timer); resolve(); },
+        reject: (err) => { clearTimeout(timer); reject(err); },
+      };
+      const timer = setTimeout(() => { this._openWaiters.delete(waiter); reject(new Error("not connected")); }, timeoutMs);
+      this._openWaiters.add(waiter);
+    });
   }
 
   async _register(handle) {

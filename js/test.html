@@ -128,6 +128,50 @@ const tests = {
     await assert.rejects(next, /not connected/);
   },
 
+  async "a request made while reconnecting waits for the new connection"() {
+    fresh();
+    const client = await connected();
+    sockets[0].drop();
+    const req = client._request(new Uint8Array([7]), (r) => r.kind === "ok", 5000);
+    await tick(2100);
+    assert.equal(sockets.length, 2);
+    sockets[1].open();
+    await tick();
+    assert.equal(hex(sockets[1].sent[0]), "07");
+    sockets[1].reply(OK);
+    assert.equal((await req).kind, "ok");
+  },
+
+  async "a request queued behind a timed-out one waits for the reconnect"() {
+    fresh();
+    const client = await connected();
+    const slow = client._request(new Uint8Array([1]), (r) => r.kind === "ok", 20);
+    const next = client._request(new Uint8Array([2]), (r) => r.kind === "ok", 5000);
+    await assert.rejects(slow, /timed out/);
+    await tick(2100);
+    sockets[1].open();
+    await tick();
+    sockets[1].reply(OK);
+    assert.equal((await next).kind, "ok");
+  },
+
+  async "waiting for a reconnect gives up after the request's timeout"() {
+    fresh();
+    const client = await connected();
+    sockets[0].drop();
+    await assert.rejects(client._request(new Uint8Array([1]), (r) => r.kind === "ok", 50), /not connected/);
+  },
+
+  async "close() ends requests waiting for a reconnect"() {
+    fresh();
+    const client = await connected();
+    sockets[0].drop();
+    const req = client._request(new Uint8Array([1]), (r) => r.kind === "ok", 5000);
+    await tick();
+    client.close();
+    await assert.rejects(req, /not connected/);
+  },
+
   async "a node error rejects the request in flight"() {
     fresh();
     const client = await connected();
