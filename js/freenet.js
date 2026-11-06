@@ -16,6 +16,7 @@
 //   const room = client.contract("chat", ownerKeyBytes);   // parameters
 //   await room.put(initialState);                           // create (once)
 //   await room.subscribe((u) => render(u.state ?? u.delta));
+//   await room.follow((state) => render(state));            // a copy kept in step, by deltas
 //   await room.update(delta);
 //
 // Speaks the node's WebSocket API with ?encodingProtocol=native (bincode).
@@ -54,6 +55,9 @@ class FreenetClient {
     this._registered = new Map();    // delegate name -> Promise<DelegateHandle>
     this._listeners = new Map();     // contract id hex -> Set of callbacks
     this._subscribed = new Map();    // contract id hex -> Promise (subscription on this connection)
+    this._summaries = new Map();     // contract id hex -> summary of the page's copy (`follow`), sent when subscribing
+    this._followers = new Map();     // contract id hex -> Follower
+    this._runners = new Map();       // code hash hex -> ContractRunner
     this._streams = new Map();       // stream id -> chunks of a large response
     this._everOpened = false;
     this._closing = false;
@@ -297,16 +301,40 @@ class FreenetClient {
   }
 
   // One Subscribe per contract and connection, shared by concurrent callers.
+  // With a summary of what the page holds (`follow`), the node sends deltas
+  // against it; without one, the whole state on every change.
   _ensureSubscribed(id, idHex) {
     let pending = this._subscribed.get(idHex);
     if (!pending) {
-      // ClientRequest::ContractOp(ContractRequest::Subscribe { key, summary: None })
-      const req = new Writer().u32(1).u32(3).raw(id).u8(0).finish();
-      pending = this._request(req, (r) => r.kind === "subscribed" && equalBytes(r.key.id, id));
+      pending = this._subscribeRequest(id, this._summaries.get(idHex) ?? null);
       this._subscribed.set(idHex, pending);
       pending.catch(() => { if (this._subscribed.get(idHex) === pending) this._subscribed.delete(idHex); });
     }
     return pending;
+  }
+
+  // Subscribe again with a newer summary: the node replaces the one it keeps
+  // for this connection, so its next deltas start from there.
+  _resubscribe(id, idHex, summary) {
+    this._summaries.set(idHex, summary);
+    const pending = this._subscribeRequest(id, summary);
+    this._subscribed.set(idHex, pending);
+    pending.catch(() => { if (this._subscribed.get(idHex) === pending) this._subscribed.delete(idHex); });
+    return pending;
+  }
+
+  _subscribeRequest(id, summary) {
+    // ClientRequest::ContractOp(ContractRequest::Subscribe { key, summary: Option<StateSummary> })
+    const w = new Writer().u32(1).u32(3).raw(id);
+    const req = (summary === null ? w.u8(0) : w.u8(1).bytes(summary)).finish();
+    return this._request(req, (r) => r.kind === "subscribed" && equalBytes(r.key.id, id));
+  }
+
+  _runner(codeHash, wasm) {
+    const hashHex = bytesToHex(codeHash);
+    let runner = this._runners.get(hashHex);
+    if (!runner) this._runners.set(hashHex, runner = new ContractRunner(wasm()));
+    return runner;
   }
 }
 
@@ -459,6 +487,179 @@ class ContractHandle {
     set.add(onUpdate);
     try { await c._ensureSubscribed(this.id, idHex); } catch (err) { set.delete(onUpdate); throw err; }
     return () => set.delete(onUpdate);
+  }
+
+  /**
+   * Keep a copy of the contract's state in the page, in step with the node,
+   * receiving only what changed. `onState(state)` (a Uint8Array) is called
+   * with the current state once the page has it, and after every change.
+   *
+   * A plain `subscribe` gets the whole state on every change: the node sends
+   * a client deltas only against a summary of what it holds. So `follow`
+   * merges each delta into its copy with the contract's own code
+   * (`update_state`, run in the page as the node runs it, so the copy is the
+   * node's state exactly), summarizes the copy (`summarize_state`) and
+   * subscribes again with that summary. A merge that fails falls back to a
+   * fresh `get`. Needs the contract's code: an embedded contract
+   * (`client.contract(name, ...)`). One copy per contract and client, shared
+   * by every `follow` on it.
+   *
+   * Resolves, once subscribed, to `{ state(), stop() }`: the current copy
+   * (or null before the network has the contract), and a function that
+   * removes `onState`.
+   */
+  async follow(onState) {
+    if (!this._wasm) throw new Error("follow needs the contract code: use client.contract(name, ...) with an embedded contract");
+    const c = this.client;
+    const idHex = bytesToHex(this.id);
+    let f = c._followers.get(idHex);
+    if (!f) c._followers.set(idHex, f = new Follower(this, c._runner(this.codeHash, this._wasm)));
+    f.callbacks.add(onState);
+    try { await f.started; } catch (err) { f.callbacks.delete(onState); throw err; }
+    if (f.state !== null) {
+      try { onState(f.state); } catch (err) { console.error(err); }
+    }
+    return { state: () => f.state, stop: () => f.callbacks.delete(onState) };
+  }
+}
+
+/**
+ * The page's copy of one contract's state (`ContractHandle.follow`). Changes
+ * are handled one at a time, in arrival order; after a burst, one Subscribe
+ * with the summary of the result.
+ */
+class Follower {
+  constructor(handle, runner) {
+    this.handle = handle;
+    this.runner = runner;
+    this.state = null;
+    this.callbacks = new Set();
+    this._chain = Promise.resolve();
+    this._pending = 0;
+    this._latest = null;        // a summary waiting to be sent
+    this._subscribing = false;  // a Subscribe in flight
+    const c = handle.client, id = handle.id, idHex = bytesToHex(id);
+    this._resubscribe = (summary) => c._resubscribe(id, idHex, summary);
+    this.started = (async () => {
+      const state = await handle.get();
+      // notifications from here on (the listener set `subscribe` uses)
+      let set = c._listeners.get(idHex);
+      if (!set) c._listeners.set(idHex, set = new Set());
+      set.add((update) => this._enqueue(update));
+      if (state === null) return c._ensureSubscribed(id, idHex); // the first change brings the whole state
+      this.state = state;
+      // a Subscribe of its own even if the page already subscribed: the node must get the summary.
+      // What changed since the `get` comes as a delta against it.
+      await c._resubscribe(id, idHex, await runner.summarize(handle.parameters, state));
+    })();
+    this.started.catch(() => { if (c._followers.get(idHex) === this) c._followers.delete(idHex); });
+  }
+
+  _enqueue(update) {
+    this._pending++;
+    this._chain = this._chain.then(() => this._apply(update)).catch((err) => console.warn("freenet.js: follow:", err.message));
+  }
+
+  async _apply(update) {
+    const { handle, runner } = this;
+    let state = null;
+    try {
+      if (update.state) state = update.state;
+      else if (update.delta && this.state !== null) state = await runner.merge(handle.parameters, this.state, update.delta);
+    } catch (err) {
+      console.warn("freenet.js: follow: merging a delta failed; fetching the state:", err.message);
+    }
+    state ??= await handle.get(); // no copy yet, a related-contract update, or a failed merge
+    this._pending--;
+    if (state === null) return;
+    this.state = state;
+    for (const fn of this.callbacks) {
+      try { fn(state); } catch (err) { console.error(err); }
+    }
+    // after the last queued change only: one Subscribe per burst
+    if (this._pending === 0) this._sendSummary(await runner.summarize(handle.parameters, state));
+  }
+
+  // Sends the summary without holding up the next change (a Subscribe to a contract another
+  // node hosts takes a network round trip). One Subscribe in flight; meanwhile only the latest
+  // summary waits. If one fails, the node keeps the older summary and its deltas carry more; a
+  // reconnect subscribes with the latest.
+  _sendSummary(summary) {
+    this._latest = summary;
+    if (this._subscribing) return;
+    this._subscribing = true;
+    (async () => {
+      while (this._latest !== null) {
+        const next = this._latest;
+        this._latest = null;
+        await this._resubscribe(next).catch((err) => console.warn("freenet.js: follow: subscribing with the new summary failed:", err.message));
+      }
+      this._subscribing = false;
+    })();
+  }
+}
+
+/**
+ * An embedded contract's code, run in the page the way the node runs it: a
+ * fresh instance for each call (contracts never free; the node drops the
+ * instance), inputs written through `__frnt__initiate_buffer`, and a
+ * bincode `Result` read back from the result struct. Contracts may log; any
+ * other import is refused when the call is made.
+ */
+class ContractRunner {
+  constructor(wasm) {
+    this._module = WebAssembly.compile(wasm);
+  }
+
+  /** `summarize_state(parameters, state)`: the summary (Uint8Array). */
+  async summarize(parameters, state) {
+    return (await this._call("summarize_state", 3, [parameters, state])).bytes().slice();
+  }
+
+  /** `update_state` with one delta: the new state, or null if the contract gave none. */
+  async merge(parameters, state, delta) {
+    const updates = new Writer().u64(1).u32(1).bytes(delta).finish(); // Vec<UpdateData>: [Delta(delta)]
+    const r = await this._call("update_state", 2, [parameters, state, updates]);
+    return r.u8() === 1 ? r.bytes().slice() : null; // UpdateModification.new_state: Option<Bytes>
+  }
+
+  // Calls `entry` with the inputs; a Reader past the Ok tag of its Result.
+  async _call(entry, kind, inputs) {
+    const module = await this._module;
+    const imports = {};
+    for (const imp of WebAssembly.Module.imports(module)) {
+      const fn = imp.module === "freenet_log" ? () => {} : () => {
+        throw new Error(`the contract imports ${imp.module}.${imp.name}, which the page doesn't provide`);
+      };
+      (imports[imp.module] ??= {})[imp.name] = fn;
+    }
+    const { exports: ex } = await WebAssembly.instantiate(module, imports);
+    ex.__frnt_set_id?.(0n);
+    const args = inputs.map((bytes) => {
+      const builder = ex.__frnt__initiate_buffer(bytes.length); // BufferBuilder { start i64, capacity u32, last_read i64, last_write i64 }
+      const view = new DataView(ex.memory.buffer);
+      const b = Number(builder);
+      new Uint8Array(ex.memory.buffer, Number(view.getBigInt64(b, true)), bytes.length).set(bytes);
+      view.setUint32(Number(view.getBigInt64(b + 24, true)), bytes.length, true);
+      return builder;
+    });
+    const res = Number(ex[entry](...args)); // ContractResult { ptr i64, kind i32, size u32 }
+    const view = new DataView(ex.memory.buffer);
+    if (view.getInt32(res + 8, true) !== kind) throw new Error(`${entry}: the contract returned a result of another kind`);
+    const r = new Reader(new Uint8Array(ex.memory.buffer, Number(view.getBigInt64(res, true)), view.getUint32(res + 12, true)).slice());
+    if (r.u32() !== 0) throw new Error(`${entry} failed: ${contractErrorText(r)}`);
+    return r;
+  }
+}
+
+// ContractError: 0 Deser(String), 1 InvalidUpdate, 2 InvalidUpdateWithInfo { reason }, 3 InvalidState, 4 InvalidDelta, 5 Other(String)
+function contractErrorText(r) {
+  try {
+    const v = r.u32();
+    if (v === 0 || v === 2 || v === 5) return r.text();
+    return ["", "invalid update", "", "invalid state", "invalid delta"][v] ?? `error ${v}`;
+  } catch {
+    return "unreadable error";
   }
 }
 

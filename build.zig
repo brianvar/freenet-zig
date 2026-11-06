@@ -42,6 +42,16 @@ pub fn build(b: *Build) void {
     run_check.addArg("--contract");
     run_check.addArtifactArg2(webcontainer, .{});
     test_step.dependOn(&run_check.step);
+
+    // The contract js/test.html's `follow` tests run in the page, written next to it as
+    // js/test-contract.js (git-ignored): run `zig build test` before opening test.html.
+    const test_contract = wasmCompile(b, mod, "test_contract", b.path("js/test_contract.zig"), .safe, &@import("src/abi.zig").contract_exports);
+    const embed = b.addRunArtifact(tool(b, mod, "embed_test_contract", "js/embed_test_contract.zig", target));
+    embed.addArtifactArg2(test_contract, .{});
+    const test_contract_js = embed.addOutputFileArg("test-contract.js");
+    const write_js = b.addUpdateSourceFiles();
+    write_js.addCopyFileToSource(test_contract_js, "js/test-contract.js");
+    test_step.dependOn(&write_js.step);
 }
 
 fn tool(b: *Build, mod: *Build.Module, name: []const u8, path: []const u8, target: Build.ResolvedTarget) *Build.Step.Compile {

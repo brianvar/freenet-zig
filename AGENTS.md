@@ -38,6 +38,7 @@ tools/pack.zig          freenet-pack: page + delegates -> signed, publishable si
 tools/check_wasm.zig    freenet-check-wasm: exports/imports of built Wasm against the ABI
 js/freenet.js           browser client (WebSocket API, bincode, BLAKE3, base58); no dependencies
 js/test.html            browser tests for the client (open the file; fake WebSocket)
+js/test_contract.zig    the contract test.html's `follow` tests run in the page; `zig build test` writes it to js/test-contract.js (git-ignored) with js/embed_test_contract.zig
 build.zig               the module, tools, tests, and helpers apps call
 docs/                   guides (getting-started, delegates, contracts, web-apps, build, testing, internals)
 examples/counter/       a contract + delegate + page
@@ -48,7 +49,7 @@ CHANGELOG.md            what changed, and what breaks
 
 ```sh
 zig build test      # library unit + wire-format tests, and an ABI check of the web container
-# open js/test.html in a browser for the client's tests
+# then open js/test.html in a browser for the client's tests (it loads js/test-contract.js, which `zig build test` writes)
 ```
 
 `zig build` in an app needs the app's signing key (`fdev website init <name>`, see
@@ -101,6 +102,16 @@ below); `zig build test` does not.
 - **freenet.js defines one global, `FreenetClient`** (an IIFE). Helpers are in
   `FreenetClient.util`; the error class is `FreenetClient.Error`. Don't add globals:
   page scripts that reuse a name would break.
+- **`follow` runs the contract's own Wasm in the page.** The node sends a
+  subscribed client a delta only against the summary it registered with, and
+  never refreshes that summary, so a plain subscription gets the whole state on
+  every change (measured in freenet-coin: 88-288 MB to a page for 600 small
+  updates). `follow` keeps a copy, merges deltas with `update_state`,
+  summarizes it with `summarize_state` and subscribes again (subscribing again
+  replaces the summary the node keeps for the connection; freenet-core 0.2.155,
+  `register_contract_notifier`). Running the contract's code, not a JS port,
+  keeps the copy byte-identical to the node's. The page's CSP allows it
+  (`'unsafe-eval'` in the sandbox's `default-src`).
 - **Replies carry no request id**, so requests go out one at a time, an error goes to
   the request in flight, and a timeout closes the connection (a late reply could
   otherwise answer the next request).

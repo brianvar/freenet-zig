@@ -14,6 +14,7 @@ next to it and drives it with a fake WebSocket.</p>
 <div id="summary">running…</div>
 
 <script src="freenet.js"></script>
+<script src="test-contract.js"></script> <!-- written by `zig build test` (js/test_contract.zig) -->
 <script>
 (async () => {
 "use strict";
@@ -72,12 +73,60 @@ async function connected(options = {}) {
   return pending;
 }
 
+// ---- follow helpers -----------------------------------------------------------------
+
+const enc = new TextEncoder(), text = (b) => new TextDecoder().decode(b);
+const u64le = (v) => cat(le32(v), le32(0));
+const lenBytes = (t) => { const b = typeof t === "string" ? enc.encode(t) : t; return cat(u64le(b.length), b); };
+const CODE_HASH = new Uint8Array(32).fill(0x33);
+const contractId = () => FreenetClient.util.blake3(cat(CODE_HASH, enc.encode("p")));
+const keyBytes = () => cat(contractId(), CODE_HASH);
+// Ok(ContractResponse::GetResponse { key, contract: None, state })
+const getResponse = (state) => cat(le32(0), le32(0), le32(0), keyBytes(), [0], lenBytes(state));
+// Ok(ContractResponse::SubscribeResponse { key, subscribed: true })
+const SUBSCRIBED_FOR = () => cat(le32(0), le32(0), le32(4), keyBytes(), [1]);
+let SUBSCRIBED;
+// Ok(ContractResponse::UpdateNotification { key, update: State(0) | Delta(1) })
+const notification = (kind, data) => cat(le32(0), le32(0), le32(2), keyBytes(), le32(kind), lenBytes(data));
+/** The summary a Subscribe request carries, as text; null for none. */
+function subscribed(req) {
+  assert.equal(hex(req.subarray(0, 8)), hex(cat(le32(1), le32(3))), "a Subscribe");
+  assert.equal(hex(req.subarray(8, 40)), hex(contractId()), "for the contract");
+  if (req[40] === 0) return null;
+  return text(req.subarray(49));
+}
+async function until(cond, ms = 3000) {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error(`waited ${ms} ms for ${cond}`);
+    await tick(5);
+  }
+}
+/** A client following contract "t" (parameters "p") whose state on the node is `state`. */
+async function following(state) {
+  if (typeof TEST_CONTRACT_WASM === "undefined") throw new Error("js/test-contract.js is missing: run `zig build test` first");
+  fresh();
+  FreenetClient.contracts = { t: { wasm: TEST_CONTRACT_WASM, codeHash: "33".repeat(32) } };
+  SUBSCRIBED = SUBSCRIBED_FOR();
+  const client = await connected();
+  const sock = sockets[0];
+  const seen = [];
+  const pending = client.contract("t", "p").follow((s) => seen.push(s));
+  await tick();
+  sock.reply(getResponse(state));
+  await until(() => sock.sent.length === 2);
+  assert.equal(subscribed(sock.sent[1]), state.split("\n").filter(Boolean).join(","));
+  sock.reply(SUBSCRIBED);
+  const f = await pending;
+  return { client, f, seen, sock };
+}
+
 // ---- tests ---------------------------------------------------------------------
 
 const tests = {
   async "only FreenetClient becomes a global"() {
     fresh();
-    for (const name of ["Writer", "Reader", "toBytes", "blake3", "FreenetError", "DelegateHandle", "ContractHandle"]) {
+    for (const name of ["Writer", "Reader", "toBytes", "blake3", "FreenetError", "DelegateHandle", "ContractHandle", "Follower", "ContractRunner"]) {
       assert.equal(typeof window[name], "undefined", name);
     }
     // a page script may use those names: a top-level class would clash if they were global
@@ -303,6 +352,117 @@ const tests = {
     FreenetClient.contracts = { c: { wasm: "", codeHash: "00".repeat(32) } };
     assert.throws(() => client.contract("c", [1, 2]), /expected a string, Uint8Array or ArrayBuffer/);
     client.contract("c", new ArrayBuffer(3)); // accepted
+  },
+
+  // ---- follow: a copy kept in step by deltas, merged with the contract's own code ----
+  // js/test_contract.zig: lines, merged as a set; summary = the lines joined by ","; a line
+  // "bad" makes a merge fail, "log" makes it call the log import.
+
+  async "follow merges deltas with the contract's code and subscribes again with its summary"() {
+    const { client, f, seen, sock } = await following("a\nb\n");
+    assert.equal(text(f.state()), "a\nb\n");
+    assert.equal(seen.map(text).join("|"), "a\nb\n");
+    sock.reply(notification(1, "c\n"));
+    await until(() => sock.sent.length === 3);
+    assert.equal(subscribed(sock.sent[2]), "a,b,c");
+    sock.reply(SUBSCRIBED);
+    await until(() => seen.length === 2);
+    assert.equal(text(f.state()), "a\nb\nc\n");
+    sock.reply(notification(1, "log\n")); // the contract may log
+    await until(() => sock.sent.length === 4);
+    assert.equal(subscribed(sock.sent[3]), "a,b,c,log");
+    sock.reply(SUBSCRIBED);
+    assert.equal(client._summaries.size, 1);
+  },
+
+  async "a burst of changes sends one Subscribe, with the summary of the last"() {
+    const { f, seen, sock } = await following("a\n");
+    sock.reply(notification(1, "b\n"));
+    sock.reply(notification(1, "c\n"));
+    sock.reply(notification(1, "d\n"));
+    await until(() => seen.length === 4);
+    await tick(20);
+    assert.equal(sock.sent.length, 3, "one more request: the Subscribe");
+    assert.equal(subscribed(sock.sent[2]), "a,b,c,d");
+    sock.reply(SUBSCRIBED);
+    assert.equal(seen.map(text).join("|"), "a\n|a\nb\n|a\nb\nc\n|a\nb\nc\nd\n");
+    assert.equal(text(f.state()), "a\nb\nc\nd\n");
+  },
+
+  async "changes don't wait for a Subscribe in flight; only the latest summary goes next"() {
+    const { seen, sock } = await following("a\n");
+    sock.reply(notification(1, "b\n"));
+    await until(() => sock.sent.length === 3); // Subscribe "a,b", not answered yet
+    assert.equal(subscribed(sock.sent[2]), "a,b");
+    sock.reply(notification(1, "c\n"));
+    await until(() => seen.length === 3);       // merged while that Subscribe waits
+    sock.reply(notification(1, "d\n"));
+    await until(() => seen.length === 4);
+    await tick(20);
+    assert.equal(sock.sent.length, 3, "nothing more while one is in flight");
+    sock.reply(SUBSCRIBED);
+    await until(() => sock.sent.length === 4);
+    assert.equal(subscribed(sock.sent[3]), "a,b,c,d", "the latest only");
+    sock.reply(SUBSCRIBED);
+    await tick(20);
+    assert.equal(sock.sent.length, 4);
+  },
+
+  async "a whole state replaces the copy; a failed merge fetches the state instead"() {
+    const { f, seen, sock } = await following("a\n");
+    sock.reply(notification(0, "x\n"));
+    await until(() => sock.sent.length === 3);
+    assert.equal(subscribed(sock.sent[2]), "x");
+    sock.reply(SUBSCRIBED);
+    sock.reply(notification(1, "bad\n"));
+    await until(() => sock.sent.length === 4);
+    assert.equal(hex(sock.sent[3].subarray(0, 8)), hex(cat(le32(1), le32(2))), "a Get");
+    sock.reply(getResponse("x\ny\n"));
+    await until(() => sock.sent.length === 5);
+    assert.equal(subscribed(sock.sent[4]), "x,y");
+    sock.reply(SUBSCRIBED);
+    assert.equal(seen.map(text).join("|"), "a\n|x\n|x\ny\n");
+    assert.equal(text(f.state()), "x\ny\n");
+  },
+
+  async "a contract the network doesn't have yet: no summary until the first state"() {
+    fresh();
+    FreenetClient.contracts = { t: { wasm: TEST_CONTRACT_WASM, codeHash: "33".repeat(32) } };
+    SUBSCRIBED = SUBSCRIBED_FOR();
+    const client = await connected();
+    const sock = sockets[0];
+    const seen = [];
+    const following_ = client.contract("t", "p").follow((s) => seen.push(s));
+    await tick();
+    // Ok(ContractResponse::NotFound { instance })
+    sock.reply(cat(le32(0), le32(0), le32(5), contractId()));
+    await until(() => sock.sent.length === 2);
+    assert.equal(subscribed(sock.sent[1]), null);
+    sock.reply(SUBSCRIBED);
+    const f = await following_;
+    assert.equal(f.state(), null);
+    assert.equal(seen.length, 0);
+    sock.reply(notification(0, "a\n"));
+    await until(() => sock.sent.length === 3);
+    assert.equal(subscribed(sock.sent[2]), "a");
+  },
+
+  async "after a reconnect, follow's subscription carries the latest summary"() {
+    const { sock } = await following("a\nb\n");
+    sock.drop();
+    await tick(2100); // the client reconnects after 2 s
+    const again = sockets.at(-1);
+    assert.ok(again !== sock, "a new socket");
+    again.open();
+    await until(() => again.sent.length === 1);
+    assert.equal(subscribed(again.sent[0]), "a,b");
+    again.reply(SUBSCRIBED);
+  },
+
+  async "follow needs the contract's code"() {
+    fresh();
+    const client = await connected();
+    await assert.rejects(client.contractAt(new Uint8Array(32).fill(5)).follow(() => {}), /needs the contract code/);
   },
 
   async "delegate failures keep the delegate's own message"() {

@@ -139,7 +139,8 @@ else throws a `TypeError`.
 | `await h.put(state, { subscribe? })` | create the instance with an initial state (needs the code: embedded contracts only). The node runs your `validateState` first |
 | `await h.update(delta)` | send `UpdateData::Delta`; your `updateState` merges it. Resolves to the new summary |
 | `await h.updateState(state)` | send `UpdateData::State`, a whole proposed state |
-| `const off = await h.subscribe(fn)` | call `fn({ state?, delta? })` (Uint8Arrays) on every change; resolves once the node confirmed; `off()` removes `fn` |
+| `const off = await h.subscribe(fn)` | call `fn({ state?, delta? })` (Uint8Arrays) on every change; resolves once the node confirmed; `off()` removes `fn`. The node sends the whole state each time |
+| `const f = await h.follow(fn)` | keep a copy of the state in the page, updated by deltas: `fn(state)` (Uint8Array) now and after every change; `f.state()` is the copy, `f.stop()` removes `fn`. Embedded contracts only (see below) |
 
 `state` and `delta` arguments may be strings, `Uint8Array`s (or other typed
 arrays) or `ArrayBuffer`s.
@@ -148,14 +149,22 @@ The usual page flow:
 
 ```js
 const counter = client.contract("counter");
-let state = await counter.getText();
-if (state === null) {                 // nobody created it yet
-  await counter.put("counter-v1\n");
-  state = await counter.getText();
-}
-await counter.subscribe(async () => render(await counter.getText()));
+if ((await counter.get()) === null) await counter.put("counter-v1\n"); // nobody created it yet
+await counter.follow((state) => render(new TextDecoder().decode(state)));
 button.onclick = () => counter.update(`${me}:${n + 1}\n`);
 ```
+
+**`follow` or `subscribe`.** The node sends a subscribed client a delta only
+against a summary of what that client holds, so with `subscribe` every change
+brings the whole state, and a page that then calls `get()` downloads it twice.
+For a state that grows, use `follow`: the page keeps its own copy, merges each
+delta into it with your contract's `updateState` (the contract's own Wasm, run
+in the page as the node runs it, so the copy is exactly the node's), computes
+its summary with your `summarizeState`, and subscribes again with that summary
+after each change (once per burst). Your `getStateDelta` then decides what
+travels. A merge that fails in the page falls back to a `get()`. The contract
+may log; any other import makes the merge fail (and fall back). One copy per
+contract and client, shared by every `follow` on it.
 
 `examples/counter` is the complete version.
 
@@ -176,8 +185,10 @@ global.
 - **Notifications** arrive at any time and go to `subscribe` callbacks, never to
   the request waiting for a reply.
 - **Large responses** (over 512 KiB) are reassembled transparently.
-- **Reconnecting** re-registers delegates and renews subscriptions. Changes
-  made while disconnected are not replayed; call `get()` if you need them. A
+- **Reconnecting** re-registers delegates and renews subscriptions (a
+  `follow`'s with the summary of its copy, so the next delta brings what it
+  missed). For a plain `subscribe`, changes made while disconnected are not
+  replayed; call `get()` if you need them. A
   request made while the client reconnects waits for the new connection (up to
   its timeout) instead of failing; one in flight when the connection drops
   rejects with `"connection closed"`.

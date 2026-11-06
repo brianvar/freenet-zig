@@ -96,7 +96,7 @@ updates and subscribes to it:
 ```js
 const counter = client.contract("counter");          // from addWebApp's .contracts
 if ((await counter.getText()) === null) await counter.put("counter-v1\n");
-await counter.subscribe(async () => render(await counter.getText()));
+await counter.follow((state) => render(state));         // a copy kept in step by deltas
 await counter.update(`${me}:${clicks}\n`);            // merged by the contract's updateState
 ```
 
