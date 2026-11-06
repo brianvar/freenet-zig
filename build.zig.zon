@@ -12,5 +12,6 @@
         "js/freenet.js",
         "README.md",
         "AGENTS.md",
+        "LICENSE",
     },
 }

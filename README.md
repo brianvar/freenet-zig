@@ -131,4 +131,4 @@ zig fetch --save git+https://github.com/brianvar/freenet-zig
 
 The wire formats follow freenet-stdlib and freenet-core as of November 2026.
 
-License: [AGPL-3.0](LICENSE)
+License: [MIT](LICENSE)

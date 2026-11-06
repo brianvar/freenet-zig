@@ -1,4 +1,5 @@
 // freenet.js: minimal browser client for Freenet web apps (no dependencies).
+// Copyright (c) 2026 holdmylatte. MIT License: https://opensource.org/license/mit
 //
 // In your page, load it with a script tag whose src is "freenet.js".
 // `freenet-pack` writes this file, plus the table of your embedded delegates
