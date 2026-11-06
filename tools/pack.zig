@@ -7,6 +7,7 @@
 //!                --file index.html=<path> [--file <name>=<path>]...
 //!                [--delegate <name>=<delegate.wasm>]...
 //!                [--embed-contract <name>=<contract.wasm>]...
+//!   freenet-pack --web-contract <web_container.wasm> --key <key file> --app-id-out <file>
 //!
 //! * `--key` is the *name* of a key made by `fdev website init <name>`
 //!   (freenet-core's own tool). It is looked up where `fdev` keeps it,
@@ -26,6 +27,10 @@
 //!   Parameters = the public key (what the built-in web container expects).
 //!
 //! Writes to <dir>: web_container.wasm, state.bin, params.bin, web.tar.xz, site.txt
+//!
+//! With `--app-id-out`, it only writes the app's id (base58, as in URLs) to
+//! that file. The id doesn't depend on the site, so a build can know it before
+//! the page exists (`addAppId`), for instance to link to the app from elsewhere.
 
 const std = @import("std");
 const Io = std.Io;
@@ -47,6 +52,7 @@ pub fn main(init: std.process.Init) !void {
     var version: ?u32 = null;
     var client_path: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
+    var app_id_out: ?[]const u8 = null;
     var files: std.ArrayList(Named) = .empty;
     var delegates: std.ArrayList(Named) = .empty;
     var contracts: std.ArrayList(Named) = .empty;
@@ -65,6 +71,8 @@ pub fn main(init: std.process.Init) !void {
             out_dir = value;
         } else if (std.mem.eql(u8, arg, "--key")) {
             key_path = value;
+        } else if (std.mem.eql(u8, arg, "--app-id-out")) {
+            app_id_out = value;
         } else if (std.mem.eql(u8, arg, "--version")) {
             version = std.fmt.parseInt(u32, value, 10) catch return usage("--version must be a whole number above 0, got {s}", .{value});
             if (version.? == 0) return usage("--version must be above 0", .{});
@@ -76,7 +84,9 @@ pub fn main(init: std.process.Init) !void {
             try contracts.append(arena, try splitNamed(value));
         } else return usage("unknown option {s}", .{arg});
     }
-    if (contract_path == null or client_path == null or out_dir == null or key_path == null)
+    if (app_id_out != null) {
+        if (contract_path == null or key_path == null) return usage("--app-id-out needs --web-contract and --key", .{});
+    } else if (contract_path == null or client_path == null or out_dir == null or key_path == null)
         return usage("--web-contract, --client, --key and --out-dir are required", .{});
 
     const cwd = Io.Dir.cwd();
@@ -94,6 +104,10 @@ pub fn main(init: std.process.Init) !void {
     const public_key = key_pair.public_key.toBytes();
     const contract_wasm = try read(io, arena, contract_path.?);
     const app_id = freenet.types.contractInstanceId(contract_wasm, &public_key);
+    if (app_id_out) |path| {
+        var id_b58: [64]u8 = undefined;
+        return Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = freenet.types.encodeBase58(&id_b58, &app_id) });
+    }
 
     // freenet.js = the client + the embedded delegates and contracts.
     var client_js: Io.Writer.Allocating = .init(arena);
@@ -240,6 +254,7 @@ fn usage(comptime fmt: []const u8, args: anytype) error{InvalidArgs} {
         \\                    --key <key file> [--version <n>]
         \\                    --file index.html=<path> [--file <name>=<path>]...
         \\                    [--delegate <name>=<wasm>]... [--embed-contract <name>=<wasm>]...
+        \\       freenet-pack --web-contract <wasm> --key <key file> --app-id-out <file>
         \\
     , .{});
     return error.InvalidArgs;

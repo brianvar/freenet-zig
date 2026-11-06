@@ -147,7 +147,7 @@ pub const WebApp = struct {
 /// Packs a page and its delegates into a publishable web app using the
 /// built-in web-container contract.
 pub fn addWebApp(b: *Build, dep: *Build.Dependency, options: WebAppOptions) WebApp {
-    const contract = wasmCompile(b, dep.module("freenet"), "web_container", dep.path("src/webcontainer_main.zig"), .safe, &@import("src/abi.zig").contract_exports);
+    const contract = webContainer(b, dep);
 
     const run = b.addRunArtifact(dep.artifact("freenet-pack"));
     run.addArg("--web-contract");
@@ -185,6 +185,25 @@ pub fn addWebApp(b: *Build, dep: *Build.Dependency, options: WebAppOptions) WebA
     for (options.contracts) |c| install.dependOn(&b.addInstallArtifact(c, .{}).step);
 
     return .{ .contract = contract, .output = output, .install = install };
+}
+
+fn webContainer(b: *Build, dep: *Build.Dependency) *Build.Step.Compile {
+    return wasmCompile(b, dep.module("freenet"), "web_container", dep.path("src/webcontainer_main.zig"), .safe, &@import("src/abi.zig").contract_exports);
+}
+
+/// The id the web app signed with `signing_key` gets (a text file: base58, as
+/// in its URL `/v1/contract/web/<id>/`). It depends only on the key and the
+/// web container, not on the page, so other build steps can use it before the
+/// page is built, for instance to link back to the app from content it creates.
+/// Like `addWebApp`, it needs the key on the building machine.
+pub fn addAppId(b: *Build, dep: *Build.Dependency, signing_key: []const u8) Build.LazyPath {
+    const run = b.addRunArtifact(dep.artifact("freenet-pack"));
+    run.addArg("--web-contract");
+    run.addArtifactArg2(webContainer(b, dep), .{});
+    run.addArgs(&.{ "--key", signing_key });
+    run.has_side_effects = true; // the key is read from outside the build
+    run.addArg("--app-id-out");
+    return run.addOutputFileArg2("app_id.txt", .{});
 }
 
 pub const TestOptions = struct {

@@ -42,6 +42,17 @@ Both return a normal `*std.Build.Step.Compile`. Install it with
 Packs a page, delegates and contract code with the built-in signed web
 container. Needs a `signing_key`. See [web-apps.md](web-apps.md#addwebapp).
 
+### addAppId
+
+```zig
+const app_id = freenet.addAppId(b, dep, "myapp"); // LazyPath: a text file with the base58 id
+```
+
+The id `addWebApp` will give the app signed with that key, available before the
+page is built (it depends only on the key and the web container). Use it to put
+a link back to the app (`/v1/contract/web/<id>/`) into content the app creates.
+Needs the key, like `addWebApp`.
+
 ### addTests
 
 ```zig
@@ -69,7 +80,10 @@ freenet-pack --web-contract <web_container.wasm> --client <freenet.js> --out-dir
              --file index.html=<path> [--file <name>=<path>]...
              [--delegate <name>=<delegate.wasm>]...
              [--embed-contract <name>=<contract.wasm>]...
+freenet-pack --web-contract <web_container.wasm> --key <key name> --app-id-out <file>
 ```
+
+The second form only writes the app's id (base58) to `<file>` (`addAppId`).
 
 1. Reads the signing key and computes the app's id: the contract key,
    BLAKE3(BLAKE3(web container code) ‖ public key).
