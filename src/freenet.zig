@@ -11,6 +11,8 @@ pub const webapp = @import("webapp.zig");
 pub const testing = @import("testing.zig");
 pub const bincode = @import("bincode.zig");
 pub const abi = @import("abi.zig");
+/// Native programs talking to a node (WebSocket API): get a state, send a delta.
+pub const client = @import("client.zig");
 
 // ---- delegates ----
 pub const exportDelegate = delegate.exportDelegate;

@@ -32,6 +32,7 @@ src/types.zig           ids, key derivation (BLAKE3), base58
 src/webapp.zig          web-app state layout, tar, stored xz, signed-site metadata (CBOR), verify/sign
 src/webcontainer.zig    the built-in signed web contract used by addWebApp
 src/testing.zig         native harness for apps' tests (+ the codecs only tests need)
+src/client.zig          native WebSocket client (get a state, send a delta), for tools beside a node
 src/tests.zig           byte-exact wire-format tests
 tools/pack.zig          freenet-pack: page + delegates -> signed, publishable site
 tools/check_wasm.zig    freenet-check-wasm: exports/imports of built Wasm against the ABI
@@ -128,6 +129,11 @@ below); `zig build test` does not.
   metadata 1 kB; WebSocket message 100 MiB (responses over 512 KiB arrive as
   `StreamChunk`s). Pages run in a sandboxed iframe without `allow-same-origin`: no
   `localStorage`, cookies or IndexedDB.
+- **The node checks the WebSocket `Host` header** against an allowlist (localhost,
+  127.0.0.1, [::1], the machine's .local name, each with and without the port), and
+  streams responses over 512 KiB as a `StreamHeader` then 256 KiB `StreamChunk`
+  messages (each its own unfragmented frame) that reassemble into the serialized
+  `Result<HostResponse, ClientError>`. `src/client.zig` and freenet.js both handle it.
 - **Contracts must not use randomness** (every peer must compute the same result);
   freenet-check-wasm rejects a contract that imports `freenet_rand`.
 - **Delegates not built through `addWebApp` have no app id**; `requireApp` refuses

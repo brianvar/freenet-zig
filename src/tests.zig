@@ -304,3 +304,221 @@ test "contract: summarize bytes and typed helpers" {
     const res = try t.update(Counter, "", "1", &.{ .{ .delta = "+1" }, .{ .delta = "+1" } });
     try testing.expectEqualStrings("3", res.ok.new_state);
 }
+
+// ---- client (WebSocket API) ----------------------------------------------------
+// Requests as freenet.js's Writer calls produce them; responses as the node
+// serializes `Result<HostResponse, ClientError>` (client_api/client_events.rs).
+
+const id: [32]u8 = @splat(0x11);
+const other_id: [32]u8 = @splat(0x22);
+const code_hash: [32]u8 = @splat(0x33);
+
+/// A fake node: the frames it sends (unmasked, binary) and what the client wrote.
+const FakeNode = struct {
+    input: std.Io.Writer.Allocating,
+    in: std.Io.Reader = undefined,
+    out: std.Io.Writer.Allocating,
+
+    fn init() FakeNode {
+        return .{ .input = .init(testing.allocator), .out = .init(testing.allocator) };
+    }
+
+    fn deinit(n: *FakeNode) void {
+        n.input.deinit();
+        n.out.deinit();
+    }
+
+    /// Queues one message, in frames of at most `frame_len` bytes.
+    fn send(n: *FakeNode, payload: []const u8, frame_len: usize) !void {
+        const w = &n.input.writer;
+        var i: usize = 0;
+        while (true) {
+            const part = payload[i..][0..@min(frame_len, payload.len - i)];
+            const fin = i + part.len == payload.len;
+            try w.writeByte(@as(u8, if (fin) 0x80 else 0) | @as(u8, if (i == 0) 2 else 0));
+            if (part.len < 126) {
+                try w.writeByte(@intCast(part.len));
+            } else if (part.len <= 0xffff) {
+                try w.writeByte(126);
+                try w.writeInt(u16, @intCast(part.len), .big);
+            } else {
+                try w.writeByte(127);
+                try w.writeInt(u64, part.len, .big);
+            }
+            try w.writeAll(part);
+            i += part.len;
+            if (fin) break;
+        }
+    }
+
+    fn client(n: *FakeNode) freenet.client.Client {
+        n.in = .fixed(n.input.written());
+        var c: freenet.client.Client = .init(testing.allocator, testing.io, &n.in, &n.out.writer);
+        c.fixed_mask = .{ 0, 0, 0, 0 }; // payloads go out as they are
+        return c;
+    }
+};
+
+const get_request = le32(1) ++ le32(2) ++ id ++ [_]u8{ 0, 0, 0 }; // ContractOp(Get { id, false, false, false })
+const ok_contract = le32(0) ++ le32(0); // Ok(HostResponse::ContractResponse(..))
+fn getResponse(comptime key_id: [32]u8, comptime state: []const u8) [8 + 4 + 64 + 1 + 8 + state.len]u8 {
+    // GetResponse { key: ContractKey { id, code_hash }, contract: None, state }
+    return ok_contract ++ le32(0) ++ key_id ++ code_hash ++ [_]u8{0} ++ vec(state);
+}
+/// Err(ClientError { kind: RequestError(ContractError(<v> ...)) })
+const contract_error = le32(1) ++ le32(8) ++ le32(0);
+
+test "client: get request bytes, and the state from a GetResponse" {
+    var n: FakeNode = .init();
+    defer n.deinit();
+    try n.send(&getResponse(id, "the state"), 1000);
+    var c = n.client();
+    const state = (try c.get(testing.allocator, id)).?;
+    defer testing.allocator.free(state);
+    try testing.expectEqualStrings("the state", state);
+    // FIN + binary, masked, 43 bytes; mask 0
+    try testing.expectEqualSlices(u8, &([_]u8{ 0x82, 0x80 | 43, 0, 0, 0, 0 } ++ get_request), n.out.written());
+}
+
+test "client: the client masks its frames" {
+    var n: FakeNode = .init();
+    defer n.deinit();
+    try n.send(&getResponse(id, "s"), 1000);
+    var c = n.client();
+    c.fixed_mask = .{ 0xff, 0, 0xff, 0 };
+    const state = (try c.get(testing.allocator, id)).?;
+    testing.allocator.free(state);
+    var expected = get_request;
+    for (&expected, 0..) |*b, i| b.* ^= c.fixed_mask.?[i % 4];
+    try testing.expectEqualSlices(u8, &([_]u8{ 0x82, 0x80 | 43, 0xff, 0, 0xff, 0 } ++ expected), n.out.written());
+}
+
+test "client: get skips other replies, and decodes a contract container" {
+    var n: FakeNode = .init();
+    defer n.deinit();
+    try n.send(&(ok_contract ++ le32(5) ++ other_id), 1000); // NotFound for another contract
+    try n.send(&(le32(0) ++ le32(3)), 1000); // Ok(HostResponse::Ok)
+    // GetResponse with Some(ContractContainer::Wasm(V1(WrappedContract { data, params, key })))
+    try n.send(&(ok_contract ++ le32(0) ++ id ++ code_hash ++ [_]u8{1} ++
+        le32(0) ++ le32(0) ++ vec("wasm") ++ code_hash ++ vec("params") ++ id ++ code_hash ++ vec("st")), 1000);
+    var c = n.client();
+    const state = (try c.get(testing.allocator, id)).?;
+    defer testing.allocator.free(state);
+    try testing.expectEqualStrings("st", state);
+}
+
+test "client: the ways a node says it doesn't have the contract" {
+    const replies = [_][]const u8{
+        &(ok_contract ++ le32(5) ++ id), // ContractResponse::NotFound { instance_id }
+        &(contract_error ++ le32(6) ++ id), // MissingContract { key }
+        &(contract_error ++ le32(0) ++ id ++ code_hash ++ vec("Contract state Not Found")), // Get { key, cause }
+    };
+    for (replies) |reply| {
+        var n: FakeNode = .init();
+        defer n.deinit();
+        try n.send(reply, 1000);
+        var c = n.client();
+        try testing.expect(try c.get(testing.allocator, id) == null);
+    }
+}
+
+test "client: other errors fail the request, and say why" {
+    var n: FakeNode = .init();
+    defer n.deinit();
+    try n.send(&(contract_error ++ le32(0) ++ id ++ code_hash ++ vec("timed out")), 1000);
+    try n.send(&(contract_error ++ le32(6) ++ other_id), 1000); // MissingContract, not ours
+    try n.send(&(le32(1) ++ le32(6) ++ vec("boom")), 1000); // Unhandled { cause }
+    var c = n.client();
+    var b58: [64]u8 = undefined;
+    const id_text = freenet.types.encodeBase58(&b58, &id);
+    try testing.expectError(error.NodeError, c.get(testing.allocator, id));
+    try testing.expect(std.mem.startsWith(u8, c.lastError(), "Get "));
+    try testing.expect(std.mem.endsWith(u8, c.lastError(), ": timed out"));
+    try testing.expectEqualStrings(id_text, c.lastError()[4 .. c.lastError().len - 11]);
+    try testing.expectError(error.NodeError, c.get(testing.allocator, id));
+    try testing.expect(std.mem.startsWith(u8, c.lastError(), "MissingContract "));
+    try testing.expectError(error.NodeError, c.get(testing.allocator, id));
+    try testing.expectEqualStrings("Unhandled: boom", c.lastError());
+    try testing.expectError(error.ConnectionClosed, c.get(testing.allocator, id)); // no more input
+}
+
+test "client: a large state in fragments, and a streamed response" {
+    const big = try testing.allocator.alloc(u8, 200_000);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i * 31);
+    var res: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer res.deinit();
+    try res.writer.writeAll(&(ok_contract ++ le32(0) ++ id ++ code_hash ++ [_]u8{0} ++ le64(200_000)));
+    try res.writer.writeAll(big);
+    const whole = res.written();
+
+    var n: FakeNode = .init();
+    defer n.deinit();
+    try n.send(whole, 70_000); // fragments with 64-bit lengths, then a 16-bit one
+    // StreamHeader { stream_id: 9, total_bytes, content: GetResponse { key, includes_contract: false } }
+    try n.send(&(le32(0) ++ le32(5) ++ le32(9) ++ le64(200_085) ++ le32(0) ++ id ++ code_hash ++ [_]u8{0}), 1000);
+    // StreamChunk { stream_id, index, total, data } x 3, out of order
+    const cuts = [_]usize{ 0, 80_000, 160_000, whole.len };
+    for ([_]u32{ 1, 0, 2 }) |i| {
+        var chunk: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer chunk.deinit();
+        const data = whole[cuts[i]..cuts[i + 1]];
+        try chunk.writer.writeAll(&(le32(0) ++ le32(4) ++ le32(9)));
+        try chunk.writer.writeInt(u32, i, .little);
+        try chunk.writer.writeInt(u32, 3, .little);
+        try chunk.writer.writeInt(u64, data.len, .little);
+        try chunk.writer.writeAll(data);
+        try n.send(chunk.written(), 1 << 20);
+    }
+    var c = n.client();
+    for (0..2) |_| {
+        const state = (try c.get(testing.allocator, id)).?;
+        defer testing.allocator.free(state);
+        try testing.expectEqualSlices(u8, big, state);
+    }
+}
+
+test "client: update sends a Delta and returns the summary" {
+    var n: FakeNode = .init();
+    defer n.deinit();
+    try n.send(&(ok_contract ++ le32(3) ++ id ++ code_hash ++ vec("sum")), 1000); // UpdateResponse { key, summary }
+    var c = n.client();
+    const summary = try c.update(testing.allocator, id, code_hash, "delta!");
+    defer testing.allocator.free(summary);
+    try testing.expectEqualStrings("sum", summary);
+    // ContractOp(Update { key: ContractKey { id, code_hash }, data: UpdateData::Delta(bytes) })
+    const request = le32(1) ++ le32(1) ++ id ++ code_hash ++ le32(1) ++ vec("delta!");
+    try testing.expectEqualSlices(u8, &([_]u8{ 0x82, 0x80 | request.len, 0, 0, 0, 0 } ++ request), n.out.written());
+
+    var n2: FakeNode = .init();
+    defer n2.deinit();
+    try n2.send(&(contract_error ++ le32(2) ++ id ++ code_hash ++ vec("invalid delta")), 1000);
+    var c2 = n2.client();
+    try testing.expectError(error.NodeError, c2.update(testing.allocator, id, code_hash, "x"));
+    try testing.expect(std.mem.endsWith(u8, c2.lastError(), ": invalid delta"));
+}
+
+test "client: put sends the code, params and state; a PutResponse or an UpdateResponse counts" {
+    const wasm = "\x00asm-code";
+    const params = "pp";
+    const put_id = freenet.types.contractInstanceId(wasm, params);
+    const put_hash = freenet.types.codeHash(wasm);
+    // ContractOp(Put { contract: Wasm(V1(WrappedContract { data: ContractCode { data, code_hash }, params, key })),
+    //   state, related_contracts: empty, subscribe: false, blocking_subscribe: false }), as freenet.js `put`
+    const request = le32(1) ++ le32(0) ++ le32(0) ++ le32(0) ++ vec(wasm) ++ put_hash ++ vec(params) ++ put_id ++ put_hash ++ vec("state") ++ [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 0, 0 };
+    for ([_][]const u8{ &(ok_contract ++ le32(1) ++ put_id ++ put_hash), &(ok_contract ++ le32(3) ++ put_id ++ put_hash ++ vec("sum")) }) |reply| {
+        var n: FakeNode = .init();
+        defer n.deinit();
+        try n.send(reply, 1000);
+        var c = n.client();
+        try c.put(testing.allocator, wasm, params, "state");
+        // over 125 bytes: the 16-bit extended length
+        try testing.expectEqualSlices(u8, &([_]u8{ 0x82, 0x80 | 126, 0, request.len, 0, 0, 0, 0 } ++ request), n.out.written());
+    }
+    var n2: FakeNode = .init();
+    defer n2.deinit();
+    try n2.send(&(contract_error ++ le32(1) ++ put_id ++ put_hash ++ vec("invalid state")), 1000);
+    var c2 = n2.client();
+    try testing.expectError(error.NodeError, c2.put(testing.allocator, wasm, params, "x"));
+    try testing.expect(std.mem.endsWith(u8, c2.lastError(), ": invalid state"));
+}
