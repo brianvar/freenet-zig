@@ -37,6 +37,7 @@ messages; use [secrets](#secrets) for anything persistent.
 pub const Inbound = union(enum) {
     application: ApplicationMessage, // from a web app (or another client)
     user_response: UserResponse,     // an answer to a prompt, see below
+    contract_state: ContractState,   // a contract's state you asked for, see below
     unsupported: struct { tag: u32, raw: []const u8 },
 };
 
@@ -48,8 +49,9 @@ pub const ApplicationMessage = struct {
 ```
 
 `payload` is whatever the page sent: text, JSON, or your own binary format.
-`user_response` is covered under [Asking the user](#asking-the-user).
-`unsupported` covers the node's other message kinds (contract responses,
+`user_response` is covered under [Asking the user](#asking-the-user),
+`contract_state` under [Reading a contract](#reading-a-contract).
+`unsupported` covers the node's other message kinds (other contract responses,
 notifications) that the library doesn't decode yet. Handle it with `=> {}` or
 `=> return`, and the node gets an empty reply. (Lifecycle and wake-up events
 are sent only to delegates that declare them in a manifest, which this library
@@ -116,6 +118,52 @@ Limits: 1 to 10 responses of 1 to 64 bytes, and a message of at most 2048
 bytes. `requestUserInput` fails beyond them, because the node would cut the
 text silently. The message is shown as UTF-8 text (or a JSON string, if it
 parses as one); control characters other than newlines are dropped.
+
+## Reading a contract
+
+A delegate can read a contract's current state, for example to check a request
+against what the network holds rather than what the page says:
+
+```zig
+const nonce = ...; // random bytes, saved in a secret with what the read is for
+try d.secrets().set("pending-read", ...);
+try d.getContract(contract_id, &nonce); // the context comes back unchanged
+```
+
+The node looks in its own store first, then on the network, and calls the
+delegate again with `.contract_state`:
+
+```zig
+pub const ContractState = struct {
+    contract_id: ContractInstanceId,
+    state: ?[]const u8, // null: not found, or the node's request failed (it doesn't say which)
+    context: []const u8, // what you passed to getContract
+};
+```
+
+The request is sent after the call's replies and prompts (the node handles it
+once the call returns); the context is at most 400 KiB
+(`DelegateContext::MAX_SIZE`).
+
+**What nodes do with it (checked 2026-11-06, freenet 0.2.155).** A network
+node calls the delegate back within milliseconds for a contract it holds (and
+with a null state for one it can't find), and replies made in that call reach
+the app's original request: the app gets one answer, as with prompts (checked
+on a network-mode gateway with no peers, in Beehive's node tests). A node in
+local mode (`freenet local`) never calls back: it answers the app's request
+as soon as the first call returns, with that call's replies only, and drops
+the request. So a delegate that reads a contract before replying gives a
+local node's app an empty answer, and the app should have a fallback.
+
+**A `.contract_state` is not proof the node sent it**: an app can send this
+message itself, with any state. Put a random value in the context, save it
+before returning, accept an answer only with that value, and clear it on every
+answer. The id of a contract is `BLAKE3(code hash ‖ parameters)`: a delegate
+that must read one particular contract computes it from that contract's code
+hash, not from an id the page passes.
+
+In tests, `freenet.testing.contractRequests()` lists what the last call asked
+for, and `freenet.testing.contractState(Impl, request, state, .{})` answers.
 
 ## Origin: who's asking
 
@@ -250,6 +298,7 @@ bytes) as parameters; see [Origin](#origin-whos-asking).
 ## Limits and notes
 
 - Calls are synchronous and should be short; the node enforces a time limit.
-- Outbound requests to contracts and other delegates
-  (`GetContractRequest`, `SendDelegateMessage`, ...) aren't wrapped yet.
+- Reading a contract is wrapped (`getContract`); the other outbound requests
+  (`PutContractRequest`, `UpdateContractRequest`, `SubscribeContractRequest`,
+  `SendDelegateMessage`) aren't yet.
 - See [testing.md](testing.md) to test all of this natively.

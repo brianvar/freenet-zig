@@ -47,7 +47,7 @@ const Echo = struct {
                 if (std.mem.eql(u8, app.payload, "origin")) return d.replyFmt("{s}", .{@tagName(d.origin)});
                 try d.reply(app.payload);
             },
-            .user_response, .unsupported => {},
+            .user_response, .contract_state, .unsupported => {},
         }
     }
 };
@@ -86,7 +86,7 @@ const Guarded = struct {
                 try d.requireApp();
                 try d.reply("secret");
             },
-            .user_response, .unsupported => {},
+            .user_response, .contract_state, .unsupported => {},
         }
     }
 };
@@ -137,7 +137,7 @@ const Prompter = struct {
                 try d.requestUserInput(0x01020304, "Pay 5?", &.{ "Cancel", "Pay" });
             },
             .user_response => |u| try d.replyFmt("{x}:{s}:{d}", .{ u.request_id, u.response, u.context.len }),
-            .unsupported => {},
+            .contract_state, .unsupported => {},
         }
     }
 };
@@ -195,11 +195,64 @@ test "delegate: requestUserInput refuses what the node would cut" {
     }
 }
 
+const Reader = struct {
+    pub fn handle(d: *freenet.Delegate, msg: freenet.Inbound) !void {
+        switch (msg) {
+            .application => |app| {
+                if (std.mem.eql(u8, app.payload, "big context")) return d.getContract(@splat(5), &@as([409601]u8, @splat(0)));
+                try d.reply("fetching");
+                try d.getContract(@splat(5), "n1");
+            },
+            .contract_state => |c| try d.replyFmt("{x}:{s}:{s}", .{ c.contract_id[0], c.state orelse "none", c.context }),
+            .user_response, .unsupported => {},
+        }
+    }
+};
+
+test "delegate: GetContractRequest bytes (last, not processed)" {
+    t.reset();
+    const out = t.raw.callDelegate(Reader, "", &web_origin, &appMsg("get"));
+    const expected = le32(0) ++ le64(2) ++ // Ok, two messages
+        le32(0) ++ vec("fetching") ++ vec("") ++ [_]u8{1} ++ // ApplicationMessage, processed
+        le32(3) ++ @as([32]u8, @splat(5)) ++ // GetContractRequest { contract_id: 32 bytes
+        vec("n1") ++ [_]u8{0}; // context: DelegateContext (Bytes), processed: false }
+    try testing.expectEqualSlices(u8, &expected, out);
+}
+
+test "delegate: GetContractResponse (tag 2) reaches handle as .contract_state" {
+    t.reset();
+    // InboundDelegateMsg::GetContractResponse { contract_id, state: Some(WrappedState), context }
+    const found = le32(2) ++ @as([32]u8, @splat(0xab)) ++ [_]u8{1} ++ vec("st") ++ vec("n1");
+    try testing.expectEqualSlices(u8, &(le32(0) ++ le64(1) ++ le32(0) ++ vec("ab:st:n1") ++ vec("") ++ [_]u8{1}), t.raw.callDelegate(Reader, "", &web_origin, &found));
+    // state: None (not found, or the node's request failed)
+    const missing = le32(2) ++ @as([32]u8, @splat(0xab)) ++ [_]u8{0} ++ vec("n1");
+    try testing.expectEqualSlices(u8, &(le32(0) ++ le64(1) ++ le32(0) ++ vec("ab:none:n1") ++ vec("") ++ [_]u8{1}), t.raw.callDelegate(Reader, "", &web_origin, &missing));
+    // a bad Option tag is a Deser error
+    const bad = le32(2) ++ @as([32]u8, @splat(0xab)) ++ [_]u8{2};
+    try testing.expectEqualSlices(u8, &(le32(1) ++ le32(0) ++ vec("InvalidOption")), t.raw.callDelegate(Reader, "", &web_origin, &bad));
+}
+
+test "delegate: testing harness shows contract requests and answers them" {
+    t.reset();
+    try testing.expectEqualStrings("fetching", (try t.ask(Reader, "get", .{}))[0]);
+    const asked = t.contractRequests();
+    try testing.expectEqual(1, asked.len);
+    try testing.expectEqual(@as([32]u8, @splat(5)), asked[0].contract_id);
+    try testing.expectEqualStrings("n1", asked[0].context);
+    const got = try t.contractState(Reader, asked[0], "state", .{});
+    try testing.expectEqualStrings("5:state:n1", got.ok[0]);
+    try testing.expectEqual(0, t.contractRequests().len);
+    try testing.expectEqualStrings("5:none:n1", (try t.contractState(Reader, asked[0], null, .{})).ok[0]);
+    // a context the node wouldn't take is refused
+    const big = try t.send(Reader, .{ .application = .{ .payload = "big context" } }, .{});
+    try testing.expectEqualStrings("a contract request's context is at most 400 KiB", big.err);
+}
+
 const Vault = struct {
     pub fn handle(d: *freenet.Delegate, msg: freenet.Inbound) !void {
         const app = switch (msg) {
             .application => |a| a,
-            .user_response, .unsupported => return,
+            .user_response, .contract_state, .unsupported => return,
         };
         const s = d.secrets();
         if (std.mem.startsWith(u8, app.payload, "set ")) {

@@ -11,7 +11,7 @@
 //! pub fn handle(d: *freenet.Delegate, msg: freenet.Inbound) !void {
 //!     switch (msg) {
 //!         .application => |app| try d.reply(app.payload), // echo
-//!         .user_response, .unsupported => {},
+//!         .user_response, .contract_state, .unsupported => {},
 //!     }
 //! }
 //! ```
@@ -70,11 +70,35 @@ pub const UserInputRequest = struct {
     responses: []const []const u8,
 };
 
+/// `GetContractResponse`: the answer to `Delegate.getContract`, in a new call.
+///
+/// Not proof that the node sent it: a web app can send this message itself,
+/// with any state. Accept it only if `context` carries a value you put in the
+/// request and saved (for example a random nonce in a secret), and clear what
+/// you saved either way.
+pub const ContractState = struct {
+    contract_id: types.ContractInstanceId,
+    /// The contract's state, or null if the node has none: not stored
+    /// locally and not found on the network, or the request failed (the node
+    /// doesn't say which).
+    state: ?[]const u8,
+    /// The `context` passed to `getContract`, unchanged.
+    context: []const u8,
+};
+
+/// A contract state request (`GetContractRequest`), queued by
+/// `Delegate.getContract`.
+pub const ContractRequest = struct {
+    contract_id: types.ContractInstanceId,
+    context: []const u8,
+};
+
 /// An inbound message (`InboundDelegateMsg`).
 pub const Inbound = union(enum) {
     application: ApplicationMessage,
     user_response: UserResponse,
-    /// Any other variant (contract responses, notifications, lifecycle
+    contract_state: ContractState,
+    /// Any other variant (other contract responses, notifications, lifecycle
     /// events, ...). Not decoded by this library yet; `raw` is the whole
     /// bincode message, `tag` its variant index.
     unsupported: struct { tag: u32, raw: []const u8 },
@@ -94,6 +118,8 @@ pub const Delegate = struct {
     replies: std.ArrayList([]const u8) = .empty,
     /// Prompts asked for so far, sent to the node after the replies.
     prompts: std.ArrayList(UserInputRequest) = .empty,
+    /// Contract state requests so far, sent to the node last.
+    contract_requests: std.ArrayList(ContractRequest) = .empty,
     failure: ?[]const u8 = null,
 
     /// Reply to the app with `payload`.
@@ -132,6 +158,25 @@ pub const Delegate = struct {
         for (responses) |r| if (r.len == 0 or r.len > max_response_len) return d.fail("prompt responses are 1 to 64 bytes");
         if (message.len > max_message_len) return d.fail("a prompt message is at most 2048 bytes");
         try d.prompts.append(d.allocator, .{ .request_id = request_id, .message = message, .responses = responses });
+    }
+
+    /// The longest `context` a contract request may carry (the node's
+    /// `DelegateContext::MAX_SIZE`).
+    pub const max_context_len = 4096 * 10 * 10;
+
+    /// Ask the node for contract `id`'s state. The node looks in its own store
+    /// first, then on the network, and calls this delegate again with a
+    /// `.contract_state` carrying `context` unchanged and the state (or null).
+    /// Replies made in that call reach the app's original request. Nodes in
+    /// local mode never call back (freenet 0.2.155; docs/delegates.md,
+    /// "Reading a contract"): the app then gets the first call's replies only.
+    ///
+    /// The answer arrives in a new call: save what the request is for in a
+    /// secret, and put a random value in `context` that you also save, since
+    /// an app can send a `.contract_state` itself (see `ContractState`).
+    pub fn getContract(d: *Delegate, id: types.ContractInstanceId, context_: []const u8) error{ OutOfMemory, DelegateFailed }!void {
+        if (context_.len > max_context_len) return d.fail("a contract request's context is at most 400 KiB");
+        try d.contract_requests.append(d.allocator, .{ .contract_id = id, .context = context_ });
     }
 
     /// Replace the delegate context (scratch state within one message batch).
@@ -230,7 +275,7 @@ pub fn Exports(comptime Impl: type) type {
                 const failed = @as(anyerror, err) == error.DelegateFailed;
                 return encodeError(.other, if (failed) (d.failure orelse "DelegateFailed") else @errorName(err));
             };
-            return encodeOk(d.replies.items, d.prompts.items);
+            return encodeOk(d.replies.items, d.prompts.items, d.contract_requests.items);
         }
     };
 }
@@ -264,21 +309,28 @@ pub fn decodeInbound(bytes: []const u8) bincode.Error!Inbound {
             .response = try r.bytes(),
             .context = try r.bytes(),
         } },
+        2 => .{ .contract_state = .{
+            .contract_id = try r.array(32),
+            .state = try r.optionalBytes(),
+            .context = try r.bytes(),
+        } },
         else => |t| .{ .unsupported = .{ .tag = t, .raw = bytes } },
     };
 }
 
 /// `Ok(Vec<OutboundDelegateMsg>)`: one `ApplicationMessage` per reply, then
-/// one `RequestUserInput` per prompt.
-fn encodeOk(replies: []const []const u8, prompts: []const UserInputRequest) []const u8 {
+/// one `RequestUserInput` per prompt, then one `GetContractRequest` per
+/// contract request (last: the node stops reading at the first one it
+/// hands to its executor).
+fn encodeOk(replies: []const []const u8, prompts: []const UserInputRequest, requests: []const ContractRequest) []const u8 {
     var w: bincode.Writer = .init(abi.allocator);
-    encodeOutbound(&w, replies, prompts) catch @trap();
+    encodeOutbound(&w, replies, prompts, requests) catch @trap();
     return w.items();
 }
 
-fn encodeOutbound(w: *bincode.Writer, replies: []const []const u8, prompts: []const UserInputRequest) Allocator.Error!void {
+fn encodeOutbound(w: *bincode.Writer, replies: []const []const u8, prompts: []const UserInputRequest, requests: []const ContractRequest) Allocator.Error!void {
     try w.tag(0); // Ok
-    try w.int(u64, replies.len + prompts.len);
+    try w.int(u64, replies.len + prompts.len + requests.len);
     for (replies) |payload| {
         try w.tag(0); // ApplicationMessage
         try w.bytes(payload);
@@ -291,6 +343,12 @@ fn encodeOutbound(w: *bincode.Writer, replies: []const []const u8, prompts: []co
         try w.bytes(p.message); // NotificationMessage
         try w.int(u64, p.responses.len);
         for (p.responses) |r| try w.bytes(r); // ClientResponse
+    }
+    for (requests) |q| {
+        try w.tag(3); // GetContractRequest (after ApplicationMessage, RequestUserInput, ContextUpdated)
+        try w.raw(&q.contract_id); // ContractInstanceId: 32 bytes, no length
+        try w.bytes(q.context); // DelegateContext
+        try w.boolean(false); // processed: not yet, the node fetches it
     }
 }
 
