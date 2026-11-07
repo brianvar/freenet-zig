@@ -11,8 +11,13 @@
 //!     defer gpa.free(state);
 //!
 //! Requests go out one at a time and wait for their answer, as in freenet.js:
-//! replies carry no request id. There is no timeout; a node that never answers
-//! blocks the call.
+//! replies carry no request id. With `connectWith(..., .{ .timeout = ... })`
+//! (or `c.timeout`), a request whose answer doesn't come in time fails with
+//! `error.Timeout`; without one, a node that never answers blocks the call.
+//!
+//!     var c = try freenet.client.Client.connectWith(gpa, io, "127.0.0.1", 7509, .{
+//!         .timeout = .fromSeconds(60),
+//!     });
 
 const std = @import("std");
 const Io = std.Io;
@@ -42,7 +47,16 @@ pub const Error = error{
     /// the socket's own error).
     ReadFailed,
     WriteFailed,
-} || Allocator.Error || Io.net.Stream.Reader.Error || Io.net.Stream.Writer.Error;
+} || Allocator.Error || Io.net.Stream.Reader.Error || Io.net.Stream.Writer.Error || SocketReader.ReadError || SocketWriter.WriteError;
+
+pub const Options = struct {
+    /// How long the WebSocket handshake, and later each request, may take
+    /// (sending it and waiting for the answer); then `error.Timeout`, and
+    /// the connection is given up. Null waits forever. The TCP connect
+    /// itself is left to the system (Zig 0.17's `ConnectOptions.timeout` is
+    /// not implemented on POSIX); a node that isn't running refuses at once.
+    timeout: ?Io.Duration = null,
+};
 
 pub const Client = struct {
     gpa: Allocator,
@@ -55,21 +69,34 @@ pub const Client = struct {
     broken: bool = false,
     /// Masks for client frames; tests fix it to get repeatable bytes.
     fixed_mask: ?[4]u8 = null,
+    /// See `Options.timeout`. Only for connections `connect` opened.
+    timeout: ?Io.Duration = null,
     error_buf: [512]u8 = undefined,
     error_len: usize = 0,
+    timeout_buf: [400]u8 = undefined,
 
     const Conn = struct {
         stream: Io.net.Stream,
-        reader: Io.net.Stream.Reader,
-        writer: Io.net.Stream.Writer,
+        reader: SocketReader,
+        writer: SocketWriter,
+        /// When the current request gives up (`arm`).
+        deadline: Io.Timeout = .none,
         read_buf: [64 * 1024]u8,
         write_buf: [64 * 1024]u8,
+        node_buf: [300]u8 = undefined,
+        node_len: usize = 0,
     };
 
-    /// Connects to `ws://<host>:<port>/v1/contract/command?encodingProtocol=native`.
-    /// `host` is an IP address or a name ("localhost"). On `error.HandshakeFailed`
-    /// there is no client to ask, so the node's status line is logged.
+    /// Connects to `ws://<host>:<port>/v1/contract/command?encodingProtocol=native`,
+    /// without a timeout. `host` is an IP address or a name ("localhost"). On
+    /// `error.HandshakeFailed` there is no client to ask, so the node's status
+    /// line is logged.
     pub fn connect(gpa: Allocator, io: Io, host: []const u8, port: u16) !Client {
+        return connectWith(gpa, io, host, port, .{});
+    }
+
+    /// `connect` with `options` (a timeout).
+    pub fn connectWith(gpa: Allocator, io: Io, host: []const u8, port: u16, options: Options) !Client {
         const stream = if (Io.net.IpAddress.parse(host, port)) |addr|
             try addr.connect(io, .{ .mode = .stream })
         else |_|
@@ -78,15 +105,18 @@ pub const Client = struct {
 
         const conn = try gpa.create(Conn);
         errdefer gpa.destroy(conn);
-        conn.stream = stream;
-        conn.reader = .init(stream, io, &conn.read_buf);
-        conn.writer = .init(stream, io, &conn.write_buf);
+        conn.* = .{ .stream = stream, .reader = undefined, .writer = undefined, .read_buf = undefined, .write_buf = undefined };
+        conn.reader = .init(conn, io, &conn.read_buf);
+        conn.writer = .init(conn, io, &conn.write_buf);
+        conn.node_len = if (std.fmt.bufPrint(&conn.node_buf, "{s}:{d}", .{ host, port })) |n| n.len else |_| 0;
 
         var c: Client = .init(gpa, io, &conn.reader.interface, &conn.writer.interface);
         c.conn = conn;
+        c.timeout = options.timeout;
+        c.arm();
         c.handshake(host, port) catch |err| {
             if (err == error.HandshakeFailed) std.log.scoped(.freenet).err("websocket handshake: {s}", .{c.lastError()});
-            return switch (err) {
+            return switch (err) { // error.Timeout: the caller knows which node it asked
                 error.ReadFailed => conn.reader.err orelse err,
                 error.WriteFailed => conn.writer.err orelse err,
                 else => err,
@@ -117,7 +147,8 @@ pub const Client = struct {
     }
 
     /// What the node said when a call failed with `error.NodeError`, or why
-    /// the handshake failed: e.g. "Update <id>: invalid delta".
+    /// the handshake failed: e.g. "Update <id>: invalid delta". After
+    /// `error.Timeout`: "the node at <host:port> didn't answer in <n> s".
     pub fn lastError(c: *const Client) []const u8 {
         return c.error_buf[0..c.error_len];
     }
@@ -131,6 +162,7 @@ pub const Client = struct {
         @memcpy(req[0..8], &[_]u8{ 1, 0, 0, 0, 2, 0, 0, 0 });
         @memcpy(req[8..40], &id);
         @memcpy(req[40..], &[_]u8{ 0, 0, 0 });
+        c.arm();
         c.send(&req) catch |err| return c.ioError(err);
 
         var streams: Reassembly = .{};
@@ -174,6 +206,7 @@ pub const Client = struct {
         @memcpy(head[40..72], &code_hash);
         std.mem.writeInt(u32, head[72..76], 1, .little);
         std.mem.writeInt(u64, head[76..84], delta.len, .little);
+        c.arm();
         c.sendParts(&.{ &head, delta }) catch |err| return c.ioError(err);
 
         var streams: Reassembly = .{};
@@ -207,6 +240,7 @@ pub const Client = struct {
         var state_len: [8]u8 = undefined;
         std.mem.writeInt(u64, &state_len, state.len, .little);
         const tail = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // related_contracts: u64 0 entries; subscribe; blocking_subscribe
+        c.arm();
         c.sendParts(&.{ &head, wasm, &code_hash, &params_len, parameters, &id, &code_hash, &state_len, state, &tail }) catch |err| return c.ioError(err);
 
         var streams: Reassembly = .{};
@@ -397,15 +431,119 @@ pub const Client = struct {
     fn ioError(c: *Client, err: Error) Error {
         c.broken = true;
         const conn = c.conn orelse return err;
-        return switch (err) {
+        const e: Error = switch (err) {
             error.ReadFailed => conn.reader.err orelse err,
             error.WriteFailed => conn.writer.err orelse err,
             else => err,
         };
+        if (e == error.Timeout) c.setError("{s}", .{c.timeoutText()});
+        return e;
+    }
+
+    /// Starts the current request's clock (`timeout`).
+    fn arm(c: *Client) void {
+        const conn = c.conn orelse return;
+        conn.deadline = if (c.timeout) |d| (Io.Timeout{ .duration = .{ .raw = d, .clock = .awake } }).toDeadline(c.io) else .none;
+    }
+
+    fn timeoutText(c: *Client) []const u8 {
+        const conn = c.conn orelse return "";
+        const ms = @divTrunc((c.timeout orelse Io.Duration.zero).nanoseconds, std.time.ns_per_ms);
+        const node = conn.node_buf[0..conn.node_len];
+        return (if (ms < 1000 or @rem(ms, 1000) != 0)
+            std.fmt.bufPrint(&c.timeout_buf, "the node at {s} didn't answer in {d} ms", .{ node, ms })
+        else
+            std.fmt.bufPrint(&c.timeout_buf, "the node at {s} didn't answer in {d} s", .{ node, @divTrunc(ms, 1000) })) catch "the node didn't answer in time";
     }
 
     fn setError(c: *Client, comptime fmt: []const u8, args: anytype) void {
         c.error_len = if (std.fmt.bufPrint(&c.error_buf, fmt, args)) |s| s.len else |_| c.error_buf.len;
+    }
+};
+
+// ---- the socket, with the request's deadline ----
+
+/// `Io.net.Stream.Reader`, but each read waits at most until the
+/// connection's deadline (`Io.operateTimeout`).
+const SocketReader = struct {
+    io: Io,
+    conn: *Client.Conn,
+    interface: Io.Reader,
+    err: ?ReadError = null,
+
+    pub const ReadError = Io.Operation.NetRead.Error || Io.OperateTimeoutError;
+
+    fn init(conn: *Client.Conn, io: Io, buffer: []u8) SocketReader {
+        return .{ .io = io, .conn = conn, .interface = .{
+            .vtable = &.{ .stream = stream, .readVec = readVec },
+            .buffer = buffer,
+            .seek = 0,
+            .end = 0,
+        } };
+    }
+
+    fn stream(io_r: *Io.Reader, io_w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        var data: [1][]u8 = .{dest};
+        const n = try readVec(io_r, &data);
+        io_w.advance(n);
+        return n;
+    }
+
+    fn readVec(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        const r: *SocketReader = @alignCast(@fieldParentPtr("interface", io_r));
+        var iovecs: [8][]u8 = undefined;
+        const dest_n, const data_size = try io_r.writableVector(&iovecs, data);
+        const done = r.io.operateTimeout(.{ .net_read = .{
+            .socket_handle = r.conn.stream.socket.handle,
+            .data = iovecs[0..dest_n],
+        } }, r.conn.deadline) catch |err| {
+            r.err = err;
+            return error.ReadFailed;
+        };
+        const result = done.net_read catch |err| {
+            r.err = err;
+            return error.ReadFailed;
+        };
+        if (result.data_len == 0) return error.EndOfStream;
+        if (result.data_len > data_size) {
+            io_r.end += result.data_len - data_size;
+            return data_size;
+        }
+        return result.data_len;
+    }
+};
+
+/// `Io.net.Stream.Writer`, but each write waits at most until the
+/// connection's deadline (a node that stops reading mid-put).
+const SocketWriter = struct {
+    io: Io,
+    conn: *Client.Conn,
+    interface: Io.Writer,
+    err: ?WriteError = null,
+
+    pub const WriteError = Io.Operation.NetWrite.Error || Io.OperateTimeoutError;
+
+    fn init(conn: *Client.Conn, io: Io, buffer: []u8) SocketWriter {
+        return .{ .io = io, .conn = conn, .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const w: *SocketWriter = @alignCast(@fieldParentPtr("interface", io_w));
+        const done = w.io.operateTimeout(.{ .net_write = .{
+            .socket_handle = w.conn.stream.socket.handle,
+            .header = io_w.buffered(),
+            .data = data,
+            .splat = splat,
+        } }, w.conn.deadline) catch |err| {
+            w.err = err;
+            return error.WriteFailed;
+        };
+        const n = done.net_write catch |err| {
+            w.err = err;
+            return error.WriteFailed;
+        };
+        return io_w.consume(n);
     }
 };
 
@@ -666,6 +804,59 @@ const Reassembly = struct {
 // ---- tests (frames; the request and response bytes are in tests.zig) ----
 
 const testing = std.testing;
+
+test "timeout: a node that accepts and never answers" {
+    const io = std.testing.io;
+    var addr: Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+    // the kernel completes the TCP handshake from the backlog: nobody accepts or answers
+    const port = server.socket.address.getPort();
+    const t0 = Io.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.Timeout, Client.connectWith(std.testing.allocator, io, "127.0.0.1", port, .{ .timeout = .fromMilliseconds(300) }));
+    const ms = Io.Timestamp.now(io, .awake).toMilliseconds() - t0.toMilliseconds();
+    try std.testing.expect(ms >= 250 and ms < 5000);
+}
+
+test "timeout: a request whose answer never comes" {
+    const io = std.testing.io;
+    var addr: Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+    // answer the handshake, then stay silent
+    const Node = struct {
+        fn run(srv: *Io.net.Server, io_: Io) void {
+            const s = srv.accept(io_) catch return;
+            var rbuf: [4096]u8 = undefined;
+            var r = s.reader(io_, &rbuf);
+            var key: []const u8 = "";
+            var key_buf: [64]u8 = undefined;
+            while (r.interface.takeDelimiterInclusive('\n')) |line| {
+                const l = trimLine(line);
+                if (l.len == 0) break;
+                if (std.ascii.startsWithIgnoreCase(l, "sec-websocket-key:")) {
+                    const v = std.mem.trim(u8, l["sec-websocket-key:".len..], " ");
+                    @memcpy(key_buf[0..v.len], v);
+                    key = key_buf[0..v.len];
+                }
+            } else |_| return;
+            var wbuf: [512]u8 = undefined;
+            var w = s.writer(io_, &wbuf);
+            w.interface.print("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{&acceptKey(key)}) catch return;
+            w.interface.flush() catch return;
+            io_.sleep(.fromSeconds(3), .awake) catch {};
+            s.close(io_);
+        }
+    };
+    var node = try io.concurrent(Node.run, .{ &server, io });
+    defer node.cancel(io);
+    var c = try Client.connectWith(std.testing.allocator, io, "127.0.0.1", port, .{ .timeout = .fromMilliseconds(300) });
+    defer c.close();
+    try std.testing.expectError(error.Timeout, c.get(std.testing.allocator, @splat(7)));
+    try std.testing.expect(std.mem.endsWith(u8, c.lastError(), "didn't answer in 300 ms"));
+    try std.testing.expectError(error.ConnectionClosed, c.get(std.testing.allocator, @splat(7))); // given up
+}
 
 test "acceptKey: the RFC 6455 example" {
     try testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &acceptKey("dGhlIHNhbXBsZSBub25jZQ=="));
