@@ -149,7 +149,7 @@ once the call returns); the context is at most 400 KiB
 node calls the delegate back within milliseconds for a contract it holds (and
 with a null state for one it can't find), and replies made in that call reach
 the app's original request: the app gets one answer, as with prompts (checked
-on a network-mode gateway with no peers, in Beehive's node tests). A node in
+on a network-mode gateway with no peers, in Hive's node tests). A node in
 local mode (`freenet local`) never calls back: it answers the app's request
 as soon as the first call returns, with that call's replies only, and drops
 the request. So a delegate that reads a contract before replying gives a

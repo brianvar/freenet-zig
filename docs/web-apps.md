@@ -209,7 +209,7 @@ global.
   keeps running with its connection closed. Mark such links
   `data-freenet-no-intercept` (the node leaves those to the browser), or
   mark them as they're clicked with a capturing `click` listener on `window`,
-  which runs before the node's on `document` (Beehive's `web/app.js` does).
+  which runs before the node's on `document` (Hive's `web/app.js` does).
 
 ```js
 client.close();
