@@ -210,6 +210,15 @@ global.
   `data-freenet-no-intercept` (the node leaves those to the browser), or
   mark them as they're clicked with a capturing `click` listener on `window`,
   which runs before the node's on `document` (Hive's `web/app.js` does).
+- **Routes.** The address bar shows the shell page, not the iframe, so a
+  hash route (`#/profile`) is lost on reload unless the page hands it to the
+  shell. `FreenetClient.syncHash()` does that: called once (no connection
+  needed), it sends the page's hash to the shell now and on every
+  `hashchange`, and follows the hash the shell sends back on back/forward or
+  an edited address. The shell replaces its address (no history entry) and,
+  on reload, loads the iframe with that hash. After changing the hash with
+  `history.replaceState` (no `hashchange`), call `FreenetClient.shareHash()`.
+  Outside a shell both do nothing.
 
 ```js
 client.close();

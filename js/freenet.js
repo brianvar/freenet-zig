@@ -69,6 +69,41 @@ class FreenetClient {
     return `${proto}://${location.host}/v1/contract/command?encodingProtocol=native`;
   }
 
+  /**
+   * Keeps the page's `#` route in the address bar, so a reload or a copied
+   * link opens the same view. The page runs in the node's shell page, inside
+   * a sandboxed iframe: its hash isn't the one the browser shows or reloads.
+   * The shell copies its own hash into the iframe when it loads it, takes a
+   * `{ type: "hash" }` message from the page (and replaces its address with
+   * it, adding no history entry), and sends one back on back/forward or an
+   * edited address. This sends the page's hash now and on every
+   * `hashchange`, and follows the shell's. Call it once, connected or not;
+   * outside a shell (a page opened directly) it does nothing. After changing
+   * the hash without a `hashchange` (`history.replaceState`), call
+   * `FreenetClient.shareHash()`.
+   */
+  static syncHash() {
+    if (FreenetClient._hashSynced || typeof window === "undefined" || !window.parent || window.parent === window) return;
+    FreenetClient._hashSynced = true;
+    window.addEventListener("hashchange", () => FreenetClient.shareHash());
+    window.addEventListener("message", (e) => {
+      const m = e.data;
+      if (e.source !== window.parent || !m || m.__freenet_shell__ !== true || m.type !== "hash") return;
+      if (typeof m.hash !== "string" || m.hash.charAt(0) !== "#" || m.hash.length > 8192) return;
+      if (m.hash !== (location.hash || "#")) location.hash = m.hash;
+    });
+    FreenetClient.shareHash();
+  }
+
+  /** Sends the page's hash to the shell page now (see `syncHash`); "#" for none. */
+  static shareHash() {
+    if (typeof window === "undefined" || !window.parent || window.parent === window) return;
+    const hash = (location.hash || "#").slice(0, 8192);
+    if (hash === FreenetClient._sharedHash) return;
+    FreenetClient._sharedHash = hash;
+    window.parent.postMessage({ __freenet_shell__: true, type: "hash", hash }, "*");
+  }
+
   // ---- delegates ----
 
   /** Register an embedded delegate (once) and return a handle to message it. */
