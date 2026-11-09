@@ -20,6 +20,7 @@
 //!     });
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const bincode = @import("bincode.zig");
@@ -463,8 +464,45 @@ pub const Client = struct {
 
 // ---- the socket, with the request's deadline ----
 
+/// `io.operateTimeout`, or, where the `Io` can't time a socket operation, the
+/// plain operation on a task of its own that is canceled at the deadline.
+/// Zig 0.17's `Io.Threaded` on Windows is such an `Io`: it returns
+/// `error.ConcurrencyUnavailable` for a timed net read or write (a TODO in
+/// `Io/Threaded.zig`). Canceling the task cancels its pending read or write
+/// (`NtCancelIoFileEx` on Windows, a signal on POSIX). Either way a missed
+/// deadline is `error.Timeout`. Drop the fallback once Zig times socket
+/// operations on Windows.
+fn operateTimed(io: Io, operation: Io.Operation, deadline: Io.Timeout) Io.OperateTimeoutError!Io.Operation.Result {
+    if (deadline == .none) return io.operate(operation);
+    if (!(builtin.is_test and test_watched)) {
+        if (io.operateTimeout(operation, deadline)) |done| return done else |err| switch (err) {
+            error.ConcurrencyUnavailable => {},
+            else => |e| return e,
+        }
+    }
+    const Done = union(enum) {
+        operation: Io.Cancelable!Io.Operation.Result,
+        deadline: Io.Cancelable!void,
+    };
+    var buffer: [2]Done = undefined;
+    var select: Io.Select(Done) = .init(io, &buffer);
+    defer select.cancelDiscard(); // the other task; waits until it has stopped
+    try select.concurrent(.operation, Io.operate, .{ io, operation });
+    try select.concurrent(.deadline, Io.Timeout.sleep, .{ deadline, io });
+    return switch (try select.await()) {
+        .operation => |result| result,
+        .deadline => |slept| {
+            try slept;
+            return error.Timeout;
+        },
+    };
+}
+
+/// Tests set it to run `operateTimed`'s fallback on any system.
+var test_watched = false;
+
 /// `Io.net.Stream.Reader`, but each read waits at most until the
-/// connection's deadline (`Io.operateTimeout`).
+/// connection's deadline (`operateTimed`).
 const SocketReader = struct {
     io: Io,
     conn: *Client.Conn,
@@ -494,7 +532,7 @@ const SocketReader = struct {
         const r: *SocketReader = @alignCast(@fieldParentPtr("interface", io_r));
         var iovecs: [8][]u8 = undefined;
         const dest_n, const data_size = try io_r.writableVector(&iovecs, data);
-        const done = r.io.operateTimeout(.{ .net_read = .{
+        const done = operateTimed(r.io, .{ .net_read = .{
             .socket_handle = r.conn.stream.socket.handle,
             .data = iovecs[0..dest_n],
         } }, r.conn.deadline) catch |err| {
@@ -530,7 +568,7 @@ const SocketWriter = struct {
 
     fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
         const w: *SocketWriter = @alignCast(@fieldParentPtr("interface", io_w));
-        const done = w.io.operateTimeout(.{ .net_write = .{
+        const done = operateTimed(w.io, .{ .net_write = .{
             .socket_handle = w.conn.stream.socket.handle,
             .header = io_w.buffered(),
             .data = data,
@@ -806,6 +844,21 @@ const Reassembly = struct {
 const testing = std.testing;
 
 test "timeout: a node that accepts and never answers" {
+    try acceptsAndNeverAnswers();
+}
+
+test "timeout: a request whose answer never comes" {
+    try answerNeverComes();
+}
+
+test "timeout without timed socket operations (Windows): the task is canceled at the deadline" {
+    test_watched = true;
+    defer test_watched = false;
+    try acceptsAndNeverAnswers();
+    try answerNeverComes(); // the handshake's write and reads go through the fallback too
+}
+
+fn acceptsAndNeverAnswers() !void {
     const io = std.testing.io;
     var addr: Io.net.IpAddress = try .parse("127.0.0.1", 0);
     var server = try addr.listen(io, .{});
@@ -818,7 +871,7 @@ test "timeout: a node that accepts and never answers" {
     try std.testing.expect(ms >= 250 and ms < 5000);
 }
 
-test "timeout: a request whose answer never comes" {
+fn answerNeverComes() !void {
     const io = std.testing.io;
     var addr: Io.net.IpAddress = try .parse("127.0.0.1", 0);
     var server = try addr.listen(io, .{});
@@ -853,7 +906,10 @@ test "timeout: a request whose answer never comes" {
     defer node.cancel(io);
     var c = try Client.connectWith(std.testing.allocator, io, "127.0.0.1", port, .{ .timeout = .fromMilliseconds(300) });
     defer c.close();
+    const t0 = Io.Timestamp.now(io, .awake);
     try std.testing.expectError(error.Timeout, c.get(std.testing.allocator, @splat(7)));
+    const ms = Io.Timestamp.now(io, .awake).toMilliseconds() - t0.toMilliseconds();
+    try std.testing.expect(ms >= 250 and ms < 2000); // at the deadline, not when the node hangs up (3 s)
     try std.testing.expect(std.mem.endsWith(u8, c.lastError(), "didn't answer in 300 ms"));
     try std.testing.expectError(error.ConnectionClosed, c.get(std.testing.allocator, @splat(7))); // given up
 }

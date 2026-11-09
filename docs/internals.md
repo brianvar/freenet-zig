@@ -23,7 +23,7 @@ Sources of truth:
 | `src/webapp.zig` | web-app state layout, tar, stored xz, signed-site metadata (CBOR) and verification |
 | `src/webcontainer.zig` | the built-in signed web contract |
 | `src/testing.zig` | the native harness (and the codecs only tests need) |
-| `src/client.zig` | native WebSocket client for the node's API (`get`, `update`, `put`), for tools beside the node; an optional per-request timeout (`connectWith(..., .{ .timeout = ... })`) |
+| `src/client.zig` | native WebSocket client for the node's API (`get`, `update`, `put`), for tools beside the node; an optional per-request timeout (`connectWith(..., .{ .timeout = ... })`; on Windows, where Zig 0.17 can't time socket operations, each read and write runs on a task canceled at the deadline) |
 | `src/tests.zig` | byte-exact wire-format tests |
 | `tools/` | `freenet-pack`, `freenet-check-wasm` |
 | `js/freenet.js` | browser client |
