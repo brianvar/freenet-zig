@@ -39,22 +39,34 @@ class FreenetClient {
   static contracts = {};
   /** How long the client waits for any sign of the node after a request timed out, before reconnecting. */
   static probeMs = 10000;
+  /**
+   * Extra connections ("lanes") for contract requests, so a slow one doesn't
+   * hold up the rest: a connection answers one request at a time (replies
+   * carry no request id). 0: everything on the one connection.
+   */
+  static lanes = 4;
+  /** How long a lane stays open with nothing to do. */
+  static laneIdleMs = 60000;
 
   /**
    * Connect to the local node (the page's own host when served by Freenet).
    * Options: url, reconnect (default true: after the connection is lost, or
    * after the node stops answering, reconnect every 2 s), onStatus(status)
-   * with status one of "connecting" | "open" | "closed".
+   * with status one of "connecting" | "open" | "closed", lanes (default
+   * `FreenetClient.lanes`: extra connections for contract gets, puts and
+   * updates, opened when first needed; see `_contractRequest`).
    */
   static connect(options = {}) {
     const client = new FreenetClient(options);
     return client._open().then(() => client);
   }
 
-  constructor({ url, reconnect = true, onStatus = () => {} } = {}) {
+  constructor({ url, reconnect = true, onStatus = () => {}, lanes = FreenetClient.lanes } = {}) {
     this.url = url ?? FreenetClient.defaultUrl();
     this.reconnect = reconnect;
     this.onStatus = onStatus;
+    this._laneCount = Math.max(0, Math.floor(lanes) || 0);
+    this._lanes = [];                // index -> { client, ready, busy, timer }: see _contractRequest
     this._inflight = null;           // the request awaiting an answer (one at a time)
     this._queue = Promise.resolve(); // serializes requests
     this._registered = new Map();    // delegate name -> Promise<DelegateHandle>
@@ -180,6 +192,8 @@ class FreenetClient {
     this._closing = true;
     for (const w of this._openWaiters) w.reject(new Error("not connected"));
     this._openWaiters.clear();
+    for (const lane of this._lanes) if (lane) { clearTimeout(lane.timer); lane.client.close(); }
+    this._lanes = [];
     this.ws?.close();
   }
 
@@ -302,8 +316,9 @@ class FreenetClient {
     }
   }
 
-  // Requests go out one at a time: replies carry no request id, so the next
-  // request is sent only after the previous one was answered or failed. A
+  // Requests on a connection go out one at a time: replies carry no request
+  // id, so the next request is sent only after the previous one was answered
+  // or failed (contract requests have lanes of their own: _contractRequest). A
   // request the node doesn't answer within `timeoutMs` fails alone: on a
   // network node a contract nobody has yet can go unanswered for long. Its
   // late answer, if any, is dropped (see _handle). Before the next request
@@ -367,6 +382,46 @@ class FreenetClient {
       return;
     }
     this._suspect = false;
+  }
+
+  // Contract gets, puts and updates go out on lanes: up to `lanes` extra
+  // connections, so a request the node is slow to answer (on a network node,
+  // a contract nobody has can take seconds) holds up only its own lane. The
+  // contract's id picks the lane (ids are hashes, so they spread evenly):
+  // every get, put and update of one contract goes out on the same lane, in
+  // the order the page made them, so a write and a later read of a contract
+  // can't pass each other. Subscriptions (and a get or put that subscribes),
+  // their notifications, and delegates stay on the main connection: a
+  // subscription belongs to the connection that made it. A lane is a client
+  // of its own (its own queue, timeout and liveness probe, reconnecting by
+  // itself), opened when first needed and closed after `laneIdleMs` with
+  // nothing to do. If it can't be opened, the request goes out on the main
+  // connection.
+  async _contractRequest(id, bytes, expects, timeoutMs, contract) {
+    if (!this._laneCount || this._closing) return this._request(bytes, expects, timeoutMs, contract);
+    const i = id[0] % this._laneCount;
+    let lane = this._lanes[i];
+    if (!lane) {
+      const client = new FreenetClient({ url: this.url, reconnect: this.reconnect, lanes: 0 });
+      lane = { client, ready: client._open(), busy: 0, timer: null };
+      this._lanes[i] = lane;
+      const opened = lane;
+      lane.ready.catch(() => { if (this._lanes[i] === opened) this._lanes[i] = null; });
+    }
+    lane.busy++;
+    clearTimeout(lane.timer);
+    try {
+      try { await lane.ready; } catch { return await this._request(bytes, expects, timeoutMs, contract); }
+      return await lane.client._request(bytes, expects, timeoutMs, contract);
+    } finally {
+      if (--lane.busy === 0 && this._lanes[i] === lane) {
+        lane.timer = setTimeout(() => {
+          if (lane.busy || this._lanes[i] !== lane) return;
+          this._lanes[i] = null;
+          lane.client.close();
+        }, FreenetClient.laneIdleMs);
+      }
+    }
   }
 
   _isOpen() {
@@ -456,7 +511,9 @@ class DelegateHandle {
    * `timeoutMs` (default 30 s) is how long to wait for the answer. Raise it
    * for a message the delegate answers only after a prompt to the user
    * (`requestUserInput`): the node waits up to 60 s for the user. Requests
-   * go out one at a time, so everything else this client sends waits too.
+   * on the main connection go out one at a time, so other delegate messages
+   * and subscriptions wait too (contract gets, puts and updates go out on
+   * lanes: see `_contractRequest`).
    */
   async send(payload, { timeoutMs = 30000 } = {}) {
     // InboundDelegateMsg::ApplicationMessage { payload, context, processed: false }
@@ -535,7 +592,10 @@ class ContractHandle {
       .u8(subscribe ? 1 : 0)       // subscribe
       .u8(0)                       // blocking_subscribe
       .finish();
-    await this.client._request(req, (r) => (r.kind === "put" || r.kind === "updated") && equalBytes(r.key.id, this.id), 30000, this.idString);
+    const expects = (r) => (r.kind === "put" || r.kind === "updated") && equalBytes(r.key.id, this.id);
+    // a put that subscribes belongs on the main connection, with the subscription
+    if (subscribe) await this.client._request(req, expects, 30000, this.idString);
+    else await this.client._contractRequest(this.id, req, expects, 30000, this.idString);
     return this;
   }
 
@@ -550,8 +610,10 @@ class ContractHandle {
     const req = new Writer().u32(1).u32(2).raw(this.id).u8(0).u8(subscribe ? 1 : 0).u8(0).finish();
     let res;
     try {
-      res = await this.client._request(req, (r) =>
-        (r.kind === "get" && equalBytes(r.key.id, this.id)) || (r.kind === "notFound" && equalBytes(r.id, this.id)), timeoutMs, this.idString);
+      const expects = (r) => (r.kind === "get" && equalBytes(r.key.id, this.id)) || (r.kind === "notFound" && equalBytes(r.id, this.id));
+      // a get that subscribes belongs on the main connection, with the subscription
+      res = subscribe ? await this.client._request(req, expects, timeoutMs, this.idString)
+        : await this.client._contractRequest(this.id, req, expects, timeoutMs, this.idString);
     } catch (err) {
       // Depending on mode and version, the node reports an unknown contract as
       // a NotFound response, or as a MissingContract / "state not found" error.
@@ -582,7 +644,7 @@ class ContractHandle {
     if (!this.codeHash) throw new Error("update needs the code hash: call get() first or pass it to contractAt");
     // ClientRequest::ContractOp(ContractRequest::Update { key: ContractKey, data: UpdateData })
     const req = new Writer().u32(1).u32(1).raw(this.id).raw(this.codeHash).u32(variant).bytes(data).finish();
-    const res = await this.client._request(req, (r) => r.kind === "updated" && equalBytes(r.key.id, this.id), 30000, this.idString);
+    const res = await this.client._contractRequest(this.id, req, (r) => r.kind === "updated" && equalBytes(r.key.id, this.id), 30000, this.idString);
     return res.summary;
   }
 

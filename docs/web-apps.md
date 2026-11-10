@@ -67,7 +67,8 @@ Connects to the node that served the page. Options:
 |---|---|---|
 | `url` | the page's host + `/v1/contract/command?encodingProtocol=native` | WebSocket URL |
 | `reconnect` | `true` | after losing the connection (or the node not answering at all after a request timed out), reconnect every 2 s; delegates are re-registered automatically |
-| `onStatus(s)` | no-op | called with `"connecting"`, `"open"` or `"closed"` |
+| `onStatus(s)` | no-op | called with `"connecting"`, `"open"` or `"closed"` (the main connection) |
+| `lanes` | `FreenetClient.lanes` (4) | extra connections for contract gets, puts and updates, so a slow one holds up only its own lane (see Ordering); 0 sends everything on the main connection |
 
 Rejects if the first connection fails; nothing is retried in that case.
 
@@ -177,7 +178,16 @@ global.
 
 ### Behavior
 
-- **Ordering.** Requests go out one at a time over one connection. Calling
+- **Ordering.** A connection answers one request at a time (replies carry
+  no request id). Contract gets, puts and updates go out on lanes: up to
+  `lanes` (default 4) extra connections, opened when first needed and closed
+  after `FreenetClient.laneIdleMs` (60 s) with nothing to do. A contract's id
+  picks its lane, so every get, put and update of one contract stays in the
+  order the page made them (a write and a later read can't pass each other),
+  while different contracts go out at once: on a network node one lookup of
+  a contract nobody has (seconds) no longer holds up the rest. Delegate
+  messages, subscriptions and a `get`/`put` with `subscribe: true` go out on
+  the main connection, one at a time; notifications arrive there. Calling
   methods concurrently is fine: calls queue and resolve in order. Each waits up
   to 30 s for the node (`get({ timeoutMs })` sets another wait). A request that
   times out fails alone, with an `Error` whose `timedOut` is true; its late

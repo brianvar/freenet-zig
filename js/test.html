@@ -65,6 +65,7 @@ function fresh() {
   FreenetClient.embedded = {};
   FreenetClient.contracts = {};
   FreenetClient.probeMs = 50;
+  FreenetClient.lanes = 0; // one connection, unless a test asks for lanes
 }
 
 async function connected(options = {}) {
@@ -277,6 +278,120 @@ const tests = {
     await tick();
     client.close();
     await assert.rejects(req, /not connected/);
+  },
+
+  async "contract requests for different contracts go out on lanes at once"() {
+    fresh();
+    FreenetClient.contracts = { c: { wasm: "AA==", codeHash: "33".repeat(32) } };
+    const client = await connected({ reconnect: false, lanes: 4 });
+    // two contracts on different lanes (the id's first byte picks the lane)
+    let a, b;
+    for (let i = 0; !a || !b; i++) {
+      const h = client.contract("c", "p" + i);
+      if (!a) a = h; else if (h.id[0] % 4 !== a.id[0] % 4) b = h;
+    }
+    const slow = a.get(), fast = b.get();
+    await tick();
+    assert.equal(sockets.length, 3, "two lanes opened beside the main connection");
+    const laneA = sockets[1], laneB = sockets[2];
+    laneA.open(); laneB.open();
+    await until(() => laneA.sent.length === 1 && laneB.sent.length === 1);
+    assert.equal(sockets[0].sent.length, 0, "nothing on the main connection");
+    laneB.reply(getResponse("B", cat(b.id, CODE_HASH))); // answered while A's is still out
+    assert.equal(text(await fast), "B", "the fast one isn't held up by the slow one");
+    laneA.reply(getResponse("A", cat(a.id, CODE_HASH)));
+    assert.equal(text(await slow), "A");
+  },
+
+  async "requests for one contract keep their order on its lane"() {
+    fresh();
+    FreenetClient.contracts = { c: { wasm: "AA==", codeHash: "33".repeat(32) } };
+    const client = await connected({ reconnect: false, lanes: 4 });
+    const h = client.contract("c", "p");
+    const order = [];
+    const update = h.update("delta").then(() => order.push("update"));
+    const get = h.get().then(() => order.push("get"));
+    await tick();
+    assert.equal(sockets.length, 2, "one lane");
+    const lane = sockets[1];
+    lane.open();
+    await until(() => lane.sent.length === 1);
+    assert.equal(hex(lane.sent[0].subarray(0, 8)), hex(cat(le32(1), le32(1))), "the update goes first");
+    // Ok(ContractResponse::UpdateResponse { key, summary })
+    lane.reply(cat(le32(0), le32(0), le32(3), cat(h.id, CODE_HASH), lenBytes("s")));
+    await until(() => lane.sent.length === 2);
+    assert.equal(hex(lane.sent[1].subarray(0, 8)), hex(cat(le32(1), le32(2))), "then the get");
+    lane.reply(getResponse("after", cat(h.id, CODE_HASH)));
+    await Promise.all([update, get]);
+    assert.equal(order.join(","), "update,get");
+  },
+
+  async "a slow request on one lane doesn't block delegates or other lanes"() {
+    fresh();
+    FreenetClient.contracts = { c: { wasm: "AA==", codeHash: "33".repeat(32) } };
+    FreenetClient.embedded = { r: { wasm: "AA==", key: "11".repeat(32), codeHash: "22".repeat(32) } };
+    const client = await connected({ reconnect: false, lanes: 2 });
+    const reg = client.delegate("r");
+    await tick();
+    sockets[0].reply(OK);
+    const handle = await reg;
+    const missing = client.contract("c", "nobody has this");
+    const slow = missing.get({ timeoutMs: 60 }); // a network node that never answers
+    await tick();
+    sockets[1].open();
+    const sending = handle.send("hi");
+    await until(() => sockets[0].sent.length === 2);
+    sockets[0].reply(cat(le32(0), le32(1), new Uint8Array(32).fill(0x11), new Uint8Array(32).fill(0x22), new Uint8Array(8)));
+    assert.equal((await sending).length, 0, "the delegate answered while the lookup is out");
+    await assert.rejects(slow, (e) => e.timedOut);
+    assert.equal(sockets.length, 2, "the timeout reconnected nothing");
+  },
+
+  async "subscriptions stay on the main connection; lanes close when idle"() {
+    fresh();
+    FreenetClient.contracts = { c: { wasm: "AA==", codeHash: "33".repeat(32) } };
+    const client = await connected({ reconnect: false, lanes: 4 });
+    const h = client.contract("c", "p");
+    const updates = [];
+    const sub = h.subscribe((u) => updates.push(u));
+    await tick();
+    assert.equal(sockets.length, 1, "no lane for a subscription");
+    assert.equal(hex(sockets[0].sent[0].subarray(0, 8)), hex(cat(le32(1), le32(3))), "Subscribe on the main connection");
+    sockets[0].reply(cat(le32(0), le32(0), le32(4), cat(h.id, CODE_HASH), [1]));
+    await sub;
+    const got = h.get();
+    await tick();
+    sockets[1].open();
+    await until(() => sockets[1].sent.length === 1);
+    sockets[1].reply(getResponse("now", cat(h.id, CODE_HASH)));
+    await got;
+    // a notification still comes on the main connection
+    sockets[0].reply(cat(le32(0), le32(0), le32(2), cat(h.id, CODE_HASH), le32(0), lenBytes("changed")));
+    assert.equal(updates.length, 1, "the subscription's notification arrived");
+    // a get that subscribes goes out on the main connection too
+    const subGet = h.get({ subscribe: true });
+    await tick();
+    assert.equal(sockets[0].sent.length, 2, "get with subscribe on the main connection");
+    sockets[0].reply(getResponse("now", cat(h.id, CODE_HASH)));
+    await subGet;
+    FreenetClient.laneIdleMs = 20;
+    const again = h.get();
+    await tick();
+    sockets[1].reply(getResponse("now", cat(h.id, CODE_HASH)));
+    await again;
+    await tick(60);
+    assert.equal(sockets[1].readyState, 3, "an idle lane closes");
+    assert.equal(sockets[0].readyState, 1, "the main connection stays");
+    const later = h.get();
+    await tick();
+    assert.equal(sockets.length, 3, "and opens again when needed");
+    sockets[2].open();
+    await until(() => sockets[2].sent.length === 1);
+    sockets[2].reply(getResponse("later", cat(h.id, CODE_HASH)));
+    assert.equal(text(await later), "later");
+    client.close();
+    assert.equal(client._lanes.length, 0, "close() closes the lanes");
+    FreenetClient.laneIdleMs = 60000;
   },
 
   async "a node error rejects the request in flight"() {

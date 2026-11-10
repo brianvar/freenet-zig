@@ -4,6 +4,19 @@ What changed, and what breaks. Newest first.
 
 ## Unreleased
 
+- **freenet.js: several requests at once (lanes).** A connection answers one
+  request at a time (replies carry no request id), so on a network node one
+  `get` of a contract nobody had (6–8 s) held up every request behind it.
+  Contract gets, puts and updates now go out on up to `lanes` extra
+  connections (`FreenetClient.connect({ lanes })`, default
+  `FreenetClient.lanes` = 4), picked by the contract id: one contract's
+  requests keep their order, different contracts go out at once.
+  Subscriptions (and a `get`/`put` with `subscribe: true`), notifications
+  and delegates stay on the main connection. Lanes open on first use and
+  close after `FreenetClient.laneIdleMs` (60 s) idle. A local node accepts
+  the extra connections from one page (checked). Breaks: a page now opens up
+  to 5 WebSocket connections; `lanes: 0` keeps the old single connection.
+
 - **freenet.js: a request that times out fails alone.** Before, a timeout
   closed the connection (a late reply could have answered the next
   request), so on a network node one `get` of a contract nobody had put yet

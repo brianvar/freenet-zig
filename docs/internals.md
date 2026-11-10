@@ -174,6 +174,17 @@ How the client handles responses:
   5 minutes as an orphan: a later reply only it expects is its late answer,
   and is dropped. An error goes to the request in flight, unless it names a
   timed-out request's contract and not the one in flight's.
+- **Lanes.** A connection carries one request at a time, so contract `Get`,
+  `Put` and `Update` requests go out on up to `lanes` (4) extra connections,
+  each a `FreenetClient` of its own with `lanes: 0` (its own queue, timeout,
+  orphans and liveness probe; it reconnects by itself). The lane is the
+  contract id's first byte modulo the lane count: ids are BLAKE3 hashes, so
+  contracts spread evenly, and one contract's requests stay in order on one
+  lane. Subscriptions belong to the connection that made them, so
+  `Subscribe`, a `Get`/`Put` with `subscribe`, delegate traffic and
+  notifications stay on the main connection. A lane opens on first use,
+  closes after `FreenetClient.laneIdleMs` (60 s) idle, and a request whose
+  lane can't open goes out on the main connection.
 - **Liveness.** On a network node a `Get` for a contract nobody has put yet
   can go unanswered, so a timeout alone doesn't mean the node is gone. Before
   the next request after a timeout, the client checks: anything the node sent
