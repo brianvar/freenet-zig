@@ -69,6 +69,7 @@ Connects to the node that served the page. Options:
 | `reconnect` | `true` | after losing the connection (or the node not answering at all after a request timed out), reconnect every 2 s; delegates are re-registered automatically |
 | `onStatus(s)` | no-op | called with `"connecting"`, `"open"` or `"closed"` (the main connection) |
 | `lanes` | `FreenetClient.lanes` (4) | extra connections for contract gets, puts and updates, so a slow one holds up only its own lane (see Ordering); 0 sends everything on the main connection |
+| `keepAliveMs` | `FreenetClient.keepAliveMs` (30 s) | when nothing went over the main connection for this long, a quick query keeps it from being dropped as idle (no answer within `FreenetClient.probeMs` reconnects); 0: never |
 
 Rejects if the first connection fails; nothing is retried in that case.
 
@@ -198,6 +199,15 @@ global.
   reconnects, if enabled) only if the node then answers nothing at all, not
   even a quick query, within `FreenetClient.probeMs` (10 s); subscriptions
   survive a timeout.
+- **Idle and reconnects.** The main connection sends the same quick query
+  after `keepAliveMs` (30 s) with nothing else going over it, so a node
+  doesn't drop it as idle and a node that is gone is noticed. After a
+  reconnect the client subscribes again and reads every subscribed contract
+  again: `subscribe` callbacks get `{ state, catchUp: true }` (and `follow`
+  copies take the state), so a change made while disconnected shows. A lane
+  the node drops is replaced when next needed, and a `get` that was out on it
+  is sent once more. Warnings name the connection: `freenet.js (main)` or
+  `freenet.js (lane N)`.
 - **Notifications** arrive at any time and go to `subscribe` callbacks, never to
   the request waiting for a reply.
 - **Large responses** (over 512 KiB) are reassembled transparently.

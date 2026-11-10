@@ -176,8 +176,11 @@ How the client handles responses:
   timed-out request's contract and not the one in flight's.
 - **Lanes.** A connection carries one request at a time, so contract `Get`,
   `Put` and `Update` requests go out on up to `lanes` (4) extra connections,
-  each a `FreenetClient` of its own with `lanes: 0` (its own queue, timeout,
-  orphans and liveness probe; it reconnects by itself). The lane is the
+  each a `FreenetClient` of its own with `lanes: 0`, named `lane N` (its own
+  queue, timeout, orphans and liveness probe). A lane doesn't reconnect: one
+  the node drops leaves its slot, the next request opens a new one, and a
+  `Get` that was out on it is sent again once (`_contractRequest`'s `retry`;
+  writes aren't repeated). The lane is the
   contract id's first byte modulo the lane count: ids are BLAKE3 hashes, so
   contracts spread evenly, and one contract's requests stay in order on one
   lane. Subscriptions belong to the connection that made them, so
@@ -185,6 +188,14 @@ How the client handles responses:
   notifications stay on the main connection. A lane opens on first use,
   closes after `FreenetClient.laneIdleMs` (60 s) idle, and a request whose
   lane can't open goes out on the main connection.
+- **Keepalive and catch-up.** The main connection (not lanes) runs a timer:
+  after `keepAliveMs` (30 s) with nothing sent or received and no request in
+  flight, a `NodeQueries(ConnectedPeers)` probe through the queue; no answer
+  within `probeMs` closes the socket (and reconnects). After a reconnect,
+  `onopen` re-registers delegates and re-subscribes as before, then
+  `_catchUp` reads every contract with listeners (on its lane) and calls them
+  with `{ state, catchUp: true }`: notifications missed while disconnected
+  aren't replayed by the node.
 - **Liveness.** On a network node a `Get` for a contract nobody has put yet
   can go unanswered, so a timeout alone doesn't mean the node is gone. Before
   the next request after a timeout, the client checks: anything the node sent

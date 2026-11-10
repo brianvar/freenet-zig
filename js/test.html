@@ -66,6 +66,7 @@ function fresh() {
   FreenetClient.contracts = {};
   FreenetClient.probeMs = 50;
   FreenetClient.lanes = 0; // one connection, unless a test asks for lanes
+  FreenetClient.keepAliveMs = 0; // no keepalive, unless a test asks for it
 }
 
 async function connected(options = {}) {
@@ -392,6 +393,81 @@ const tests = {
     client.close();
     assert.equal(client._lanes.length, 0, "close() closes the lanes");
     FreenetClient.laneIdleMs = 60000;
+  },
+
+  async "an idle main connection sends a keepalive; one the node doesn't answer reconnects"() {
+    fresh();
+    const client = await connected({ reconnect: false, keepAliveMs: 30 });
+    const sock = sockets[0];
+    const probe = hex(cat(le32(4), le32(0))); // NodeQueries(ConnectedPeers)
+    await until(() => sock.sent.length === 1);
+    assert.equal(hex(sock.sent[0]), probe, "a keepalive after 30 ms of nothing");
+    sock.reply(PEERS);
+    await until(() => sock.sent.length === 2);
+    assert.equal(hex(sock.sent[1]), probe, "and again later");
+    // no answer within probeMs (50 ms in tests): the node is gone
+    await until(() => sock.readyState === 3, 1000);
+    assert.equal(client.name, "main");
+  },
+
+  async "a busy connection sends no keepalive"() {
+    fresh();
+    const client = await connected({ reconnect: false, keepAliveMs: 40 });
+    const sock = sockets[0];
+    const req = client._request(new Uint8Array([7]), (r) => r.kind === "ok", 1000);
+    await tick(80);
+    assert.equal(sock.sent.length, 1, "only the request: a request in flight is activity");
+    sock.reply(OK);
+    await req;
+    client.close();
+  },
+
+  async "after a reconnect, subscribed contracts are read again and listeners get the state"() {
+    fresh();
+    FreenetClient.contracts = { c: { wasm: "AA==", codeHash: "33".repeat(32) } };
+    const client = await connected();
+    const h = client.contract("c", "p");
+    const updates = [];
+    const sub = h.subscribe((u) => updates.push(u));
+    await tick();
+    sockets[0].reply(cat(le32(0), le32(0), le32(4), cat(h.id, CODE_HASH), [1]));
+    await sub;
+    sockets[0].drop();
+    await tick(2100); // reconnects after 2 s
+    const again = sockets.at(-1);
+    again.open();
+    await until(() => again.sent.length === 1);
+    assert.equal(hex(again.sent[0].subarray(0, 8)), hex(cat(le32(1), le32(3))), "subscribed again first");
+    again.reply(cat(le32(0), le32(0), le32(4), cat(h.id, CODE_HASH), [1]));
+    await until(() => again.sent.length === 2);
+    assert.equal(hex(again.sent[1].subarray(0, 8)), hex(cat(le32(1), le32(2))), "then a get of it");
+    again.reply(getResponse("changed meanwhile", cat(h.id, CODE_HASH)));
+    await until(() => updates.length === 1);
+    assert.equal(text(updates[0].state), "changed meanwhile");
+    assert.ok(updates[0].catchUp, "marked as a catch-up");
+    client.close();
+  },
+
+  async "a lane the node drops is replaced, and a get on it is sent again"() {
+    fresh();
+    FreenetClient.contracts = { c: { wasm: "AA==", codeHash: "33".repeat(32) } };
+    const client = await connected({ reconnect: false, lanes: 2 });
+    const h = client.contract("c", "p");
+    const got = h.get();
+    await tick();
+    const lane = sockets[1];
+    lane.open();
+    await until(() => lane.sent.length === 1);
+    assert.equal(client._lanes[h.id[0] % 2].client.name, `lane ${h.id[0] % 2 + 1}`, "lanes are named");
+    lane.drop(); // the node drops it with the get out
+    await until(() => sockets.length === 3);
+    const next = sockets[2];
+    next.open();
+    await until(() => next.sent.length === 1);
+    next.reply(getResponse("again", cat(h.id, CODE_HASH)));
+    assert.equal(text(await got), "again");
+    assert.equal(sockets[0].sent.length, 0, "nothing on the main connection");
+    client.close();
   },
 
   async "a node error rejects the request in flight"() {

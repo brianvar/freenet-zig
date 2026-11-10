@@ -47,6 +47,13 @@ class FreenetClient {
   static lanes = 4;
   /** How long a lane stays open with nothing to do. */
   static laneIdleMs = 60000;
+  /**
+   * How often the main connection, when nothing else went over it, asks the
+   * node something every node answers at once (NodeQueries: ConnectedPeers),
+   * so an idle connection isn't dropped (and a node that is gone is noticed:
+   * no answer within `probeMs` reconnects). 0: never.
+   */
+  static keepAliveMs = 30000;
 
   /**
    * Connect to the local node (the page's own host when served by Freenet).
@@ -54,17 +61,24 @@ class FreenetClient {
    * after the node stops answering, reconnect every 2 s), onStatus(status)
    * with status one of "connecting" | "open" | "closed", lanes (default
    * `FreenetClient.lanes`: extra connections for contract gets, puts and
-   * updates, opened when first needed; see `_contractRequest`).
+   * updates, opened when first needed; see `_contractRequest`), keepAliveMs
+   * (default `FreenetClient.keepAliveMs`). After a reconnect, every
+   * subscribed contract is read again and its listeners get the state, so a
+   * change made while disconnected isn't missed.
    */
   static connect(options = {}) {
     const client = new FreenetClient(options);
     return client._open().then(() => client);
   }
 
-  constructor({ url, reconnect = true, onStatus = () => {}, lanes = FreenetClient.lanes } = {}) {
+  constructor({ url, reconnect = true, onStatus = () => {}, lanes = FreenetClient.lanes, keepAliveMs = FreenetClient.keepAliveMs, name = "main" } = {}) {
     this.url = url ?? FreenetClient.defaultUrl();
     this.reconnect = reconnect;
     this.onStatus = onStatus;
+    this.name = name;                // "main", or "lane N": warnings say which connection
+    this._keepAliveMs = Math.max(0, Number(keepAliveMs) || 0);
+    this._keepTimer = null;
+    this._lastActive = 0;            // when anything last went out or came in
     this._laneCount = Math.max(0, Math.floor(lanes) || 0);
     this._lanes = [];                // index -> { client, ready, busy, timer }: see _contractRequest
     this._inflight = null;           // the request awaiting an answer (one at a time)
@@ -190,6 +204,7 @@ class FreenetClient {
 
   close() {
     this._closing = true;
+    clearInterval(this._keepTimer);
     for (const w of this._openWaiters) w.reject(new Error("not connected"));
     this._openWaiters.clear();
     for (const lane of this._lanes) if (lane) { clearTimeout(lane.timer); lane.client.close(); }
@@ -208,7 +223,9 @@ class FreenetClient {
       let opened = false;
       ws.onopen = async () => {
         opened = true;
+        const again = this._everOpened; // a reconnect: subscribed contracts may have changed meanwhile
         this._everOpened = true;
+        this._lastActive = Date.now();
         // Requests that waited for this reconnect go first; re-registering
         // queues behind them (it would wait for them anyway).
         if (this.ws === ws) {
@@ -226,8 +243,10 @@ class FreenetClient {
           if (set.size > 0) await this._ensureSubscribed(hexToBytes(idHex), idHex).catch((err) => console.warn("freenet.js:", err.message));
         }
         if (this.ws !== ws) return reject(new Error("connection closed"));
+        this._startKeepAlive(ws);
         this.onStatus("open");
         resolve();
+        if (again) this._catchUp();
       };
       ws.onmessage = (event) => {
         // Ignore a socket we already gave up on (e.g. after a timeout).
@@ -236,6 +255,10 @@ class FreenetClient {
       ws.onclose = () => {
         if (this.ws !== ws) return;
         this.ws = null;
+        clearInterval(this._keepTimer);
+        if (opened && !this._closing) {
+          console.warn(`freenet.js (${this.name}): the connection to the node was lost${this._everOpened && this.reconnect ? "; reconnecting" : ""}`);
+        }
         if (this._inflight) {
           const entry = this._inflight;
           this._inflight = null;
@@ -258,7 +281,7 @@ class FreenetClient {
   }
 
   _handle(bytes) {
-    this._lastHeard = Date.now();
+    this._lastHeard = this._lastActive = Date.now();
     let res;
     try { res = parseHostResponse(bytes); } catch (err) { console.warn("freenet.js: bad message", err); return; }
     switch (res.kind) {
@@ -354,13 +377,14 @@ class FreenetClient {
         if (!probe) {
           this._suspect = true;
           this._timedOutAt = now;
-          console.warn(`freenet.js: the node didn't answer within ${timeoutMs / 1000} s${contract ? ` (${contract})` : ""}`);
+          console.warn(`freenet.js (${this.name}): the node didn't answer within ${timeoutMs / 1000} s${contract ? ` (${contract})` : ""}`);
         }
         const err = new Error("timed out waiting for the node");
         err.timedOut = true;
         reject(err);
       }, timeoutMs);
       this._inflight = entry;
+      this._lastActive = Date.now();
       ws.send(bytes);
     });
   }
@@ -375,13 +399,52 @@ class FreenetClient {
       await this._send(new Writer().u32(4).u32(0).finish(), (r) => r.kind === "query", FreenetClient.probeMs, null, true);
     } catch (err) {
       if (!err.timedOut) { this._suspect = false; return; } // an error is an answer too
-      console.warn(`freenet.js: the node didn't answer within ${FreenetClient.probeMs / 1000} s; reconnecting`);
+      console.warn(`freenet.js (${this.name}): the node didn't answer within ${FreenetClient.probeMs / 1000} s; reconnecting`);
       if (this.ws === ws) ws.close();
       if (!this.reconnect || this._closing) throw new Error("not connected");
       await this._reopened(timeoutMs);
       return;
     }
     this._suspect = false;
+  }
+
+  // Keepalive (main connection): when nothing went over the connection for
+  // `keepAliveMs`, a NodeQueries probe; a node that doesn't answer within
+  // `probeMs` is gone, and the connection is dropped (and reconnects, if
+  // enabled). Without it, a node may drop a connection that sits idle,
+  // and subscriptions would go quiet until the page next asked something.
+  _startKeepAlive(ws) {
+    clearInterval(this._keepTimer);
+    if (!this._keepAliveMs) return;
+    this._keepTimer = setInterval(() => {
+      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN || this._closing) return clearInterval(this._keepTimer);
+      if (this._inflight || Date.now() - this._lastActive < this._keepAliveMs) return;
+      this._lastActive = Date.now(); // one probe at a time
+      // ClientRequest::NodeQueries(NodeQuery::ConnectedPeers)
+      this._request(new Writer().u32(4).u32(0).finish(), (r) => r.kind === "query", FreenetClient.probeMs).catch((err) => {
+        if (!err.timedOut || this.ws !== ws) return; // an error is an answer too: the node is there
+        console.warn(`freenet.js (${this.name}): the node didn't answer the keepalive within ${FreenetClient.probeMs / 1000} s; reconnecting`);
+        ws.close();
+      });
+    }, Math.max(10, Math.min(this._keepAliveMs, 5000)));
+  }
+
+  // After a reconnect: what changed while the connection was down came as no
+  // notification. Every subscribed contract is read again, and its listeners
+  // (subscribe, follow) get the state as if the node had sent it. In the
+  // background: the page doesn't wait for it.
+  _catchUp() {
+    for (const [idHex, set] of this._listeners) {
+      if (!set.size) continue;
+      const id = hexToBytes(idHex), contract = base58Encode(id);
+      // ClientRequest::ContractOp(ContractRequest::Get { key, return_contract_code: false, subscribe: false, blocking_subscribe: false })
+      const req = new Writer().u32(1).u32(2).raw(id).u8(0).u8(0).u8(0).finish();
+      const expects = (r) => (r.kind === "get" && equalBytes(r.key.id, id)) || (r.kind === "notFound" && equalBytes(r.id, id));
+      this._contractRequest(id, req, expects, 30000, contract, { retry: true }).then((res) => {
+        if (res.kind !== "get") return;
+        this._listeners.get(idHex)?.forEach((fn) => { try { fn({ state: res.state, catchUp: true }); } catch (err) { console.error(err); } });
+      }, (err) => console.warn(`freenet.js (${this.name}): reading ${contract} again after the reconnect failed:`, err.message));
+    }
   }
 
   // Contract gets, puts and updates go out on lanes: up to `lanes` extra
@@ -394,25 +457,35 @@ class FreenetClient {
   // their notifications, and delegates stay on the main connection: a
   // subscription belongs to the connection that made it. A lane is a client
   // of its own (its own queue, timeout and liveness probe, reconnecting by
-  // itself), opened when first needed and closed after `laneIdleMs` with
-  // nothing to do. If it can't be opened, the request goes out on the main
-  // connection.
-  async _contractRequest(id, bytes, expects, timeoutMs, contract) {
+  // itself, but not reconnecting: a lane the node drops is replaced by a new
+  // one when next needed, and a get that was out on it is sent again, once),
+  // opened when first needed and closed after `laneIdleMs` with nothing to
+  // do. If it can't be opened, the request goes out on the main connection.
+  async _contractRequest(id, bytes, expects, timeoutMs, contract, { retry = false } = {}) {
     if (!this._laneCount || this._closing) return this._request(bytes, expects, timeoutMs, contract);
     const i = id[0] % this._laneCount;
     let lane = this._lanes[i];
     if (!lane) {
-      const client = new FreenetClient({ url: this.url, reconnect: this.reconnect, lanes: 0 });
-      lane = { client, ready: client._open(), busy: 0, timer: null };
+      let made = null;
+      const client = new FreenetClient({
+        url: this.url, reconnect: false, lanes: 0, keepAliveMs: 0, name: `lane ${i + 1}`,
+        onStatus: (s) => { if (s === "closed" && made && this._lanes[i] === made) { clearTimeout(made.timer); this._lanes[i] = null; } },
+      });
+      lane = made = { client, ready: client._open(), busy: 0, timer: null };
       this._lanes[i] = lane;
-      const opened = lane;
-      lane.ready.catch(() => { if (this._lanes[i] === opened) this._lanes[i] = null; });
+      lane.ready.catch(() => { if (this._lanes[i] === made) this._lanes[i] = null; });
     }
     lane.busy++;
     clearTimeout(lane.timer);
     try {
       try { await lane.ready; } catch { return await this._request(bytes, expects, timeoutMs, contract); }
-      return await lane.client._request(bytes, expects, timeoutMs, contract);
+      try {
+        return await lane.client._request(bytes, expects, timeoutMs, contract);
+      } catch (err) {
+        const lost = !lane.client._isOpen() && !(err instanceof FreenetError) && !err.timedOut;
+        if (!retry || !lost || this._closing) throw err;
+        return await this._contractRequest(id, bytes, expects, timeoutMs, contract); // on a new lane
+      }
     } finally {
       if (--lane.busy === 0 && this._lanes[i] === lane) {
         lane.timer = setTimeout(() => {
@@ -613,7 +686,7 @@ class ContractHandle {
       const expects = (r) => (r.kind === "get" && equalBytes(r.key.id, this.id)) || (r.kind === "notFound" && equalBytes(r.id, this.id));
       // a get that subscribes belongs on the main connection, with the subscription
       res = subscribe ? await this.client._request(req, expects, timeoutMs, this.idString)
-        : await this.client._contractRequest(this.id, req, expects, timeoutMs, this.idString);
+        : await this.client._contractRequest(this.id, req, expects, timeoutMs, this.idString, { retry: true });
     } catch (err) {
       // Depending on mode and version, the node reports an unknown contract as
       // a NotFound response, or as a MissingContract / "state not found" error.
@@ -652,7 +725,8 @@ class ContractHandle {
    * Call `onUpdate({ state?, delta? })` (Uint8Arrays) whenever the contract
    * changes. Resolves, once the node confirmed the subscription, to a
    * function that removes the callback. Subscriptions are renewed after
-   * reconnects; changes made while disconnected are not replayed.
+   * reconnects, and the contract is read again then: `onUpdate` gets
+   * `{ state, catchUp: true }`, so a change made while disconnected shows.
    */
   async subscribe(onUpdate) {
     const c = this.client;

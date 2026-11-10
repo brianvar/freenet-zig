@@ -4,6 +4,20 @@ What changed, and what breaks. Newest first.
 
 ## Unreleased
 
+- **freenet.js: keepalive, catch-up, named connections.** An idle main
+  connection was dropped by the node after a while (the page logged "the
+  network connection was lost"); now, after `keepAliveMs` (default
+  `FreenetClient.keepAliveMs` = 30 s) with nothing going over it, it sends a
+  `NodeQueries(ConnectedPeers)` probe (no answer within `probeMs`
+  reconnects). After a reconnect, every subscribed contract is read again
+  and its `subscribe` callbacks get `{ state, catchUp: true }` (`follow`
+  takes the state), so a change made while disconnected shows. Lanes don't
+  reconnect by themselves any more: a dropped lane is replaced when next
+  needed, and a `get` that was out on it is sent once more. Warnings say
+  which connection: `freenet.js (main)`, `freenet.js (lane N)`. Breaks: a
+  `subscribe` callback can get an update after a reconnect that the node
+  didn't send (`catchUp: true`); `keepAliveMs: 0` turns the probe off.
+
 - **freenet.js: several requests at once (lanes).** A connection answers one
   request at a time (replies carry no request id), so on a network node one
   `get` of a contract nobody had (6–8 s) held up every request behind it.
