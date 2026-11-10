@@ -24,6 +24,10 @@
 //!   the site, so it stays the same across releases.
 //! * The files are packed into `web.tar.xz`, signed with the key as release
 //!   `--version` (default: the current Unix time) and stored as the state.
+//! * In the `.html` files, `src="name"` and `href="name"` that name a packed
+//!   file (freenet.js included) become `name?v=<release>`: the node serves a
+//!   page uncached but its files with validators only, so without a new URL a
+//!   browser may keep an old stylesheet beside a new script after an update.
 //!   Parameters = the public key (what the built-in web container expects).
 //!
 //! Writes to <dir>: web_container.wasm, state.bin, params.bin, web.tar.xz, site.txt
@@ -139,6 +143,7 @@ pub fn main(init: std.process.Init) !void {
     try cw.print("FreenetClient.appId = \"{s}\";\n", .{&std.fmt.bytesToHex(app_id, .lower)});
 
     // The archive: the given files plus freenet.js.
+    const release = version orelse try unixTime(io);
     var packed_files: std.ArrayList(freenet.webapp.File) = .empty;
     var has_index = false;
     var loads_client = false;
@@ -156,8 +161,16 @@ pub fn main(init: std.process.Init) !void {
         return usage("delegates/contracts were given but no .html file loads {s}", .{client_name});
     try packed_files.append(arena, .{ .name = client_name, .data = client_js.written() });
 
+    // Pages load the site's own files as `name?v=<release>`, so a browser
+    // never keeps an old stylesheet or script beside a new page
+    // (`webapp.versionRefs`).
+    const names = try arena.alloc([]const u8, packed_files.items.len);
+    for (packed_files.items, names) |f, *n| n.* = f.name;
+    for (packed_files.items) |*f| {
+        if (std.mem.endsWith(u8, f.name, ".html")) f.data = try freenet.webapp.versionRefs(arena, f.data, names, release);
+    }
+
     const archive = try freenet.webapp.xzStore(arena, try freenet.webapp.tar(arena, packed_files.items));
-    const release = version orelse try unixTime(io);
     const state = try freenet.webapp.signState(arena, key_pair, release, archive);
     if (state.len > freenet.webapp.max_state_size)
         return usage("the site is {d} bytes; the node stores at most {d} (archives are not compressed)", .{ state.len, freenet.webapp.max_state_size });

@@ -293,6 +293,55 @@ fn appendVarint(out: *std.ArrayList(u8), gpa: Allocator, value: u64) Allocator.E
     try out.append(gpa, @intCast(v));
 }
 
+/// A page's references to the site's own files, with the release appended:
+/// every `src="name"` or `href="name"` (either quote, any letter case)
+/// whose value is exactly one of `names` becomes `name?v=<version>`. The
+/// node serves the page itself uncached but the files it loads with
+/// validators only, so a browser may reuse an old stylesheet beside a new
+/// script after an update; a new URL per release rules that out. Anything
+/// else (absolute or external URLs, values with a query or fragment, other
+/// attributes such as `data-src`) is left as it is. The same input gives the
+/// same bytes, so builds stay reproducible.
+pub fn versionRefs(gpa: Allocator, html: []const u8, names: []const []const u8, version: u32) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    var copied: usize = 0;
+    while (i < html.len) : (i += 1) {
+        const attr_len: usize = if (attrAt(html, i, "src")) 3 else if (attrAt(html, i, "href")) 4 else continue;
+        var j = i + attr_len;
+        while (j < html.len and isSpace(html[j])) j += 1;
+        if (j >= html.len or html[j] != '=') continue;
+        j += 1;
+        while (j < html.len and isSpace(html[j])) j += 1;
+        if (j >= html.len or (html[j] != '"' and html[j] != '\'')) continue;
+        const quote = html[j];
+        const start = j + 1;
+        const end = std.mem.indexOfScalarPos(u8, html, start, quote) orelse break;
+        const value = html[start..end];
+        for (names) |n| {
+            if (!std.mem.eql(u8, value, n)) continue;
+            try out.appendSlice(gpa, html[copied..end]);
+            try out.print(gpa, "?v={d}", .{version});
+            copied = end;
+            break;
+        }
+        i = end;
+    }
+    try out.appendSlice(gpa, html[copied..]);
+    return out.toOwnedSlice(gpa);
+}
+
+/// `name` starts at `i` as an attribute: after white space, in any letter case.
+fn attrAt(html: []const u8, i: usize, name: []const u8) bool {
+    if (i == 0 or !isSpace(html[i - 1]) or i + name.len > html.len) return false;
+    return std.ascii.eqlIgnoreCase(html[i..][0..name.len], name);
+}
+
+fn isSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '\x0c';
+}
+
 // ---- tests ----------------------------------------------------------------
 
 const testing = std.testing;
@@ -430,4 +479,41 @@ test "parseState rejects malformed layouts" {
     var big_meta: [8]u8 = undefined;
     std.mem.writeInt(u64, &big_meta, max_metadata_size + 1, .big);
     try testing.expectError(error.InvalidState, parseState(&big_meta));
+}
+
+test "versionRefs versions the site's own files and nothing else" {
+    const gpa = testing.allocator;
+    const names: []const []const u8 = &.{ "style.css", "app.js", "freenet.js", "img/logo.png" };
+    const page =
+        \\<link rel="stylesheet" href="style.css">
+        \\<link rel="icon" href="data:image/svg+xml,x">
+        \\<script src="freenet.js"></script>
+        \\<script SRC = 'app.js'></script>
+        \\<img src="img/logo.png" data-src="app.js">
+        \\<a href="https://example.com/app.js">x</a> <a href="#/app.js">y</a>
+        \\<script src="other.js"></script><script src="app.js?v=1"></script>
+        \\<p>src="app.js" in text, href=app.js unquoted</p><div xsrc="app.js"></div>
+    ;
+    const out = try versionRefs(gpa, page, names, 1234);
+    defer gpa.free(out);
+    try testing.expectEqualStrings(
+        \\<link rel="stylesheet" href="style.css?v=1234">
+        \\<link rel="icon" href="data:image/svg+xml,x">
+        \\<script src="freenet.js?v=1234"></script>
+        \\<script SRC = 'app.js?v=1234'></script>
+        \\<img src="img/logo.png?v=1234" data-src="app.js">
+        \\<a href="https://example.com/app.js">x</a> <a href="#/app.js">y</a>
+        \\<script src="other.js"></script><script src="app.js?v=1"></script>
+        \\<p>src="app.js" in text, href=app.js unquoted</p><div xsrc="app.js"></div>
+    , out);
+    // the same input, the same bytes
+    const again = try versionRefs(gpa, page, names, 1234);
+    defer gpa.free(again);
+    try testing.expectEqualStrings(out, again);
+    // a page without references, or an unterminated quote, comes back as it was
+    for ([_][]const u8{ "", "<p>hello</p>", "<script src=\"app.js" }) |p| {
+        const same = try versionRefs(gpa, p, names, 7);
+        defer gpa.free(same);
+        try testing.expectEqualStrings(p, same);
+    }
 }

@@ -4,6 +4,16 @@ What changed, and what breaks. Newest first.
 
 ## Unreleased
 
+- **freenet-pack versions a page's own files.** In each packed `.html`
+  file, `src="name"` and `href="name"` naming a file of the site
+  (`freenet.js` included) become `name?v=<release>`
+  (`webapp.versionRefs`). The node serves a page with `cache-control:
+  no-store` but its files with only validators, so after an update Safari
+  kept an old stylesheet beside a new script. External and absolute URLs,
+  values with a query or fragment, and other attributes are left alone. The
+  web container is unchanged (same code, same app id), and the same release
+  number still gives the same bytes. Nothing breaks.
+
 - **Native client: the timeout works on Windows.** Zig 0.17's `Io.Threaded`
   can't time a socket read or write on Windows (`error.ConcurrencyUnavailable`
   from `operateTimeout`), so there each read and write runs on a task of its

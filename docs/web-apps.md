@@ -257,6 +257,16 @@ Each build is a *release*, numbered by the Unix time of the build (or
 `.version = n`). The container accepts only a release higher than the current
 one, so republishing needs a later build, never an earlier one.
 
+In every packed `.html` file, `src="name"` and `href="name"` that name a file
+of the site (`freenet.js` too) become `name?v=<release>`. The node serves the
+page itself uncached but the files it loads with only `etag` and
+`last-modified`, so after an update a browser could otherwise keep an old
+stylesheet beside a new script. Only exact names are changed: absolute and
+external URLs, values that already have a query or fragment, and other
+attributes (`data-src`) stay as written. A file a page loads some other way
+(`fetch`, a script that builds a URL) isn't versioned; add `?v=` yourself if
+it can change between releases.
+
 ## The web container
 
 `addWebApp` uses `freenet.WebContainer` (`src/webcontainer.zig`), a **signed
