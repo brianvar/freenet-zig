@@ -4,6 +4,20 @@ What changed, and what breaks. Newest first.
 
 ## Unreleased
 
+- **freenet.js: a request that times out fails alone.** Before, a timeout
+  closed the connection (a late reply could have answered the next
+  request), so on a network node one `get` of a contract nobody had put yet
+  stalled the page for 30 s and then dropped every request in flight. Now
+  the timed-out request rejects (an `Error` with `timedOut: true`) and is
+  kept as an orphan whose late answer is dropped; requests name their
+  contract, so a late error naming it is dropped too. Before the next
+  request, the client checks the node is there (anything it sent, or a
+  `NodeQueries(ConnectedPeers)` probe) and reconnects only if nothing comes
+  within `FreenetClient.probeMs` (10 s). `get`/`getText` take `timeoutMs`.
+  Subscriptions survive a timeout. Breaks: a timeout no longer reconnects
+  by itself; code that relied on that (none known) now sees the probe
+  decide.
+
 - **freenet-pack versions a page's own files.** In each packed `.html`
   file, `src="name"` and `href="name"` naming a file of the site
   (`freenet.js` included) become `name?v=<release>`

@@ -27,6 +27,9 @@
 (() => {
 "use strict";
 
+/** How long a timed-out request's late answer is still recognized (and dropped). */
+const ORPHAN_MS = 5 * 60 * 1000;
+
 class FreenetClient {
   /** Filled in by freenet-pack: { name: { wasm: base64, key: hex, codeHash: hex, parameters: hex } } */
   static embedded = {};
@@ -34,12 +37,14 @@ class FreenetClient {
   static appId = null;
   /** Filled in by freenet-pack: { name: { wasm: base64, codeHash: hex } } */
   static contracts = {};
+  /** How long the client waits for any sign of the node after a request timed out, before reconnecting. */
+  static probeMs = 10000;
 
   /**
    * Connect to the local node (the page's own host when served by Freenet).
    * Options: url, reconnect (default true: after the connection is lost, or
-   * after a request times out, reconnect every 2 s), onStatus(status) with
-   * status one of "connecting" | "open" | "closed".
+   * after the node stops answering, reconnect every 2 s), onStatus(status)
+   * with status one of "connecting" | "open" | "closed".
    */
   static connect(options = {}) {
     const client = new FreenetClient(options);
@@ -62,6 +67,10 @@ class FreenetClient {
     this._everOpened = false;
     this._closing = false;
     this._openWaiters = new Set();   // requests waiting for a reconnect: { resolve, reject }
+    this._orphans = [];              // timed-out requests whose late answers are dropped: { expects, contract, at }
+    this._suspect = false;           // a request timed out: is the node still there? (see _request)
+    this._timedOutAt = 0;
+    this._lastHeard = 0;             // when the node last sent anything
   }
 
   static defaultUrl() {
@@ -221,6 +230,8 @@ class FreenetClient {
         }
         this._streams.clear();
         this._subscribed.clear();
+        this._orphans = [];
+        this._suspect = false;
         this.onStatus("closed");
         if (!opened) reject(new Error(`cannot connect to ${this.url}`));
         // Only a client that connected once reconnects; a failed first
@@ -233,6 +244,7 @@ class FreenetClient {
   }
 
   _handle(bytes) {
+    this._lastHeard = Date.now();
     let res;
     try { res = parseHostResponse(bytes); } catch (err) { console.warn("freenet.js: bad message", err); return; }
     switch (res.kind) {
@@ -244,12 +256,36 @@ class FreenetClient {
         return;
       }
     }
-    const entry = this._inflight;
+    let entry = this._inflight;
+    // A liveness probe (see _request) is answered by anything the node
+    // sends: the node is there. Its own answer may still come; it's dropped.
+    if (entry && entry.probe) {
+      this._inflight = null;
+      clearTimeout(entry.timer);
+      if (!entry.expects(res)) this._orphans.push({ expects: entry.expects, contract: null, at: Date.now() });
+      entry.resolve(res);
+      if (entry.expects(res) || res.kind === "error") return;
+      entry = null;
+    }
+    // Replies carry no request id. A reply the request in flight expects
+    // (its kind, for its contract) is its answer; one only a request that
+    // timed out expects is that one's late answer, and is dropped (requests
+    // name their contract, so the two can only be confused for the same
+    // contract, where either answer is that contract's). An error names its
+    // contract only sometimes: one naming a timed-out request's contract
+    // (and not the one in flight) is that request's; any other goes to the
+    // one in flight.
+    if (res.kind === "error") {
+      const text = `${res.error.contract ?? ""} ${res.error.message ?? ""}`;
+      const mentions = (c) => !!c && text.includes(c);
+      const i = this._orphans.findIndex((o) => mentions(o.contract));
+      if (i >= 0 && !(entry && mentions(entry.contract))) { this._orphans.splice(i, 1); return; }
+    } else if (!entry || !entry.expects(res)) {
+      const i = this._orphans.findIndex((o) => o.expects(res));
+      if (i >= 0) this._orphans.splice(i, 1);
+      return;
+    }
     if (!entry) return;
-    // Replies carry no request id. An error can't be matched to a request,
-    // so it goes to the one in flight; other replies must look like the
-    // answer we expect (e.g. not an extra SubscribeResponse).
-    if (res.kind !== "error" && !entry.expects(res)) return;
     this._inflight = null;
     clearTimeout(entry.timer);
     if (res.kind === "error") entry.reject(new FreenetError(res.error)); else entry.resolve(res);
@@ -268,32 +304,69 @@ class FreenetClient {
 
   // Requests go out one at a time: replies carry no request id, so the next
   // request is sent only after the previous one was answered or failed. A
-  // timed-out request may still be answered later, which would then look
-  // like the answer to the next one, so a timeout drops the connection (and
-  // reconnects, if enabled) instead of carrying on. A request made while the
-  // client reconnects waits for the new connection, up to its timeout.
-  _request(bytes, expects, timeoutMs = 30000) {
-    const send = () => new Promise((resolve, reject) => {
-      const ws = this.ws;
-      if (!ws || ws.readyState !== WebSocket.OPEN) return reject(new Error("not connected"));
-      const entry = { resolve, reject, expects };
-      entry.timer = setTimeout(() => {
-        if (this._inflight !== entry) return;
-        this._inflight = null;
-        console.warn(`freenet.js: the node didn't answer within ${timeoutMs / 1000} s; reconnecting`);
-        reject(new Error("timed out waiting for the node"));
-        ws.close();
-      }, timeoutMs);
-      this._inflight = entry;
-      ws.send(bytes);
-    });
+  // request the node doesn't answer within `timeoutMs` fails alone: on a
+  // network node a contract nobody has yet can go unanswered for long. Its
+  // late answer, if any, is dropped (see _handle). Before the next request
+  // goes out, the client asks the node something every node answers at once
+  // (NodeQueries: ConnectedPeers); if nothing at all comes back within
+  // `FreenetClient.probeMs`, the node is gone: the connection is dropped (and reconnects,
+  // if enabled) and the request waits for the new one. Subscriptions survive
+  // a timeout. A request made while the client reconnects waits for the new
+  // connection, up to its timeout. `contract` (base58) names the contract a
+  // request is about, to tell its late errors from the next request's.
+  _request(bytes, expects, timeoutMs = 30000, contract = null) {
     const run = async () => {
       if (!this._isOpen() && this._everOpened && this.reconnect && !this._closing) await this._reopened(timeoutMs);
-      return send();
+      if (this._suspect) await this._checkAlive(timeoutMs);
+      return this._send(bytes, expects, timeoutMs, contract);
     };
     const result = this._queue.then(run, run);
     this._queue = result.catch(() => {});
     return result;
+  }
+
+  _send(bytes, expects, timeoutMs, contract, probe = false) {
+    return new Promise((resolve, reject) => {
+      const ws = this.ws;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return reject(new Error("not connected"));
+      const entry = { resolve, reject, expects, contract, probe };
+      entry.timer = setTimeout(() => {
+        if (this._inflight !== entry) return;
+        this._inflight = null;
+        const now = Date.now();
+        this._orphans = this._orphans.filter((o) => now - o.at < ORPHAN_MS);
+        this._orphans.push({ expects, contract, at: now });
+        if (!probe) {
+          this._suspect = true;
+          this._timedOutAt = now;
+          console.warn(`freenet.js: the node didn't answer within ${timeoutMs / 1000} s${contract ? ` (${contract})` : ""}`);
+        }
+        const err = new Error("timed out waiting for the node");
+        err.timedOut = true;
+        reject(err);
+      }, timeoutMs);
+      this._inflight = entry;
+      ws.send(bytes);
+    });
+  }
+
+  // After a timeout: is the node still there? Anything it sent since says
+  // yes; otherwise a probe that anything answers. No answer: reconnect.
+  async _checkAlive(timeoutMs) {
+    if (this._lastHeard > this._timedOutAt) { this._suspect = false; return; }
+    const ws = this.ws;
+    try {
+      // ClientRequest::NodeQueries(NodeQuery::ConnectedPeers)
+      await this._send(new Writer().u32(4).u32(0).finish(), (r) => r.kind === "query", FreenetClient.probeMs, null, true);
+    } catch (err) {
+      if (!err.timedOut) { this._suspect = false; return; } // an error is an answer too
+      console.warn(`freenet.js: the node didn't answer within ${FreenetClient.probeMs / 1000} s; reconnecting`);
+      if (this.ws === ws) ws.close();
+      if (!this.reconnect || this._closing) throw new Error("not connected");
+      await this._reopened(timeoutMs);
+      return;
+    }
+    this._suspect = false;
   }
 
   _isOpen() {
@@ -362,7 +435,7 @@ class FreenetClient {
     // ClientRequest::ContractOp(ContractRequest::Subscribe { key, summary: Option<StateSummary> })
     const w = new Writer().u32(1).u32(3).raw(id);
     const req = (summary === null ? w.u8(0) : w.u8(1).bytes(summary)).finish();
-    return this._request(req, (r) => r.kind === "subscribed" && equalBytes(r.key.id, id));
+    return this._request(req, (r) => r.kind === "subscribed" && equalBytes(r.key.id, id), 30000, base58Encode(id));
   }
 
   _runner(codeHash, wasm) {
@@ -462,18 +535,23 @@ class ContractHandle {
       .u8(subscribe ? 1 : 0)       // subscribe
       .u8(0)                       // blocking_subscribe
       .finish();
-    await this.client._request(req, (r) => (r.kind === "put" || r.kind === "updated") && equalBytes(r.key.id, this.id));
+    await this.client._request(req, (r) => (r.kind === "put" || r.kind === "updated") && equalBytes(r.key.id, this.id), 30000, this.idString);
     return this;
   }
 
-  /** The current state (Uint8Array), or null if the network doesn't have it. Options: subscribe. */
-  async get({ subscribe = false } = {}) {
+  /**
+   * The current state (Uint8Array), or null if the network doesn't have it.
+   * Options: subscribe; timeoutMs (default 30 s): how long to wait. On a
+   * network node a contract nobody has put yet may go unanswered rather than
+   * not found; then `get` rejects with an error whose `timedOut` is true.
+   */
+  async get({ subscribe = false, timeoutMs = 30000 } = {}) {
     // ClientRequest::ContractOp(ContractRequest::Get { key, return_contract_code, subscribe, blocking_subscribe })
     const req = new Writer().u32(1).u32(2).raw(this.id).u8(0).u8(subscribe ? 1 : 0).u8(0).finish();
     let res;
     try {
       res = await this.client._request(req, (r) =>
-        (r.kind === "get" && equalBytes(r.key.id, this.id)) || (r.kind === "notFound" && equalBytes(r.id, this.id)));
+        (r.kind === "get" && equalBytes(r.key.id, this.id)) || (r.kind === "notFound" && equalBytes(r.id, this.id)), timeoutMs, this.idString);
     } catch (err) {
       // Depending on mode and version, the node reports an unknown contract as
       // a NotFound response, or as a MissingContract / "state not found" error.
@@ -504,7 +582,7 @@ class ContractHandle {
     if (!this.codeHash) throw new Error("update needs the code hash: call get() first or pass it to contractAt");
     // ClientRequest::ContractOp(ContractRequest::Update { key: ContractKey, data: UpdateData })
     const req = new Writer().u32(1).u32(1).raw(this.id).raw(this.codeHash).u32(variant).bytes(data).finish();
-    const res = await this.client._request(req, (r) => r.kind === "updated" && equalBytes(r.key.id, this.id));
+    const res = await this.client._request(req, (r) => r.kind === "updated" && equalBytes(r.key.id, this.id), 30000, this.idString);
     return res.summary;
   }
 
@@ -748,6 +826,7 @@ function parseHostResponse(buf) {
       }
       return { kind: "delegate", key, payloads, prompts };
     }
+    case 2: return { kind: "query" }; // HostResponse::QueryResponse (not read further: the liveness probe's answer)
     case 3: return { kind: "ok" }; // HostResponse::Ok
     case 4: return { kind: "chunk", streamId: r.u32(), index: r.u32(), total: r.u32(), data: r.bytes() };
     case 5: return { kind: "streamHeader" };

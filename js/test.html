@@ -64,6 +64,7 @@ function fresh() {
   window.WebSocket = FakeSocket;
   FreenetClient.embedded = {};
   FreenetClient.contracts = {};
+  FreenetClient.probeMs = 50;
 }
 
 async function connected(options = {}) {
@@ -82,7 +83,9 @@ const CODE_HASH = new Uint8Array(32).fill(0x33);
 const contractId = () => FreenetClient.util.blake3(cat(CODE_HASH, enc.encode("p")));
 const keyBytes = () => cat(contractId(), CODE_HASH);
 // Ok(ContractResponse::GetResponse { key, contract: None, state })
-const getResponse = (state) => cat(le32(0), le32(0), le32(0), keyBytes(), [0], lenBytes(state));
+const getResponse = (state, key = keyBytes()) => cat(le32(0), le32(0), le32(0), key, [0], lenBytes(state));
+// Ok(QueryResponse::ConnectedPeers { peers: [] }): the answer to the liveness probe after a timeout
+const PEERS = cat(le32(0), le32(2), le32(0), u64le(0));
 // Ok(ContractResponse::SubscribeResponse { key, subscribed: true })
 const SUBSCRIBED_FOR = () => cat(le32(0), le32(0), le32(4), keyBytes(), [1]);
 let SUBSCRIBED;
@@ -170,11 +173,79 @@ const tests = {
     fresh();
     const client = await connected({ reconnect: false });
     const first = sockets[0];
+    const idA = new Uint8Array(32).fill(0xa1), idB = new Uint8Array(32).fill(0xb2);
+    const getOf = (id) => (r) => r.kind === "get" && hex(r.key.id) === hex(id);
+    await assert.rejects(client._request(new Uint8Array([1]), getOf(idA), 20), (e) => e.timedOut && /timed out/.test(e.message));
+    const next = client._request(new Uint8Array([2]), getOf(idB), 1000);
+    await tick();
+    first.reply(PEERS); // the node is there
+    await until(() => first.sent.length === 3);
+    assert.equal(hex(first.sent[2]), "02", "the next request went out on the same connection");
+    first.reply(getResponse("late A", cat(idA, CODE_HASH))); // the late answer to the first request: dropped
+    let done = false;
+    next.finally(() => { done = true; }).catch(() => {});
+    await tick(10);
+    assert.equal(done, false, "the late answer didn't answer it");
+    first.reply(getResponse("B", cat(idB, CODE_HASH)));
+    assert.equal(text((await next).state), "B");
+    assert.equal(sockets.length, 1);
+  },
+
+  async "a timed-out request fails alone while the node answers the probe"() {
+    fresh();
+    const client = await connected({ reconnect: false });
+    await assert.rejects(client._request(new Uint8Array([1]), (r) => r.kind === "ok", 20), /timed out/);
+    const next = client._request(new Uint8Array([2]), (r) => r.kind === "ok", 1000);
+    await until(() => sockets[0].sent.length === 2);
+    assert.equal(hex(sockets[0].sent[1]), "0400000000000000", "NodeQueries(ConnectedPeers)");
+    sockets[0].reply(PEERS);
+    await until(() => sockets[0].sent.length === 3);
+    sockets[0].reply(OK);
+    assert.equal((await next).kind, "ok");
+    assert.equal(sockets.length, 1, "no reconnect");
+  },
+
+  async "a late error naming the timed-out request's contract doesn't fail the next one"() {
+    fresh();
+    const client = await connected({ reconnect: false });
+    const missing = "Missing1111111111111111111111111111111111", other = "Other22222222222222222222222222222222222";
+    await assert.rejects(client._request(new Uint8Array([1]), (r) => r.kind === "ok", 20, missing), /timed out/);
+    const next = client._request(new Uint8Array([2]), (r) => r.kind === "ok", 1000, other);
+    await tick();
+    sockets[0].reply(PEERS);
+    await until(() => sockets[0].sent.length === 3);
+    const cause = enc.encode(`Cannot subscribe to contract ${missing}: not cached`);
+    sockets[0].reply(cat(le32(1), le32(9), u64le(cause.length), cause)); // Err(OperationError { cause }), late, for the first
+    sockets[0].reply(OK);
+    assert.equal((await next).kind, "ok");
+  },
+
+  async "a request queued behind a timed-out one waits for the reconnect when the node is gone"() {
+    fresh();
+    const client = await connected();
+    const slow = client._request(new Uint8Array([1]), (r) => r.kind === "ok", 20);
+    const next = client._request(new Uint8Array([2]), (r) => r.kind === "ok", 5000);
+    await assert.rejects(slow, /timed out/);
+    await tick(2100); // the probe goes unanswered: the client reconnects
+    assert.equal(sockets.length, 2);
+    sockets[1].open();
+    await tick();
+    sockets[1].reply(OK);
+    assert.equal((await next).kind, "ok");
+  },
+
+  async "subscriptions survive a request that timed out"() {
+    fresh();
+    const client = await connected({ reconnect: false });
+    client._subscribed.set("aa", Promise.resolve());
     await assert.rejects(client._request(new Uint8Array([1]), (r) => r.kind === "ok", 20), /timed out/);
     const next = client._request(new Uint8Array([2]), (r) => r.kind === "ok", 1000);
     await tick();
-    first.reply(OK); // the late answer to the first request
-    await assert.rejects(next, /not connected/);
+    sockets[0].reply(PEERS);
+    await until(() => sockets[0].sent.length === 3);
+    sockets[0].reply(OK);
+    await next;
+    assert.ok(client._subscribed.has("aa"), "still subscribed");
   },
 
   async "a request made while reconnecting waits for the new connection"() {
@@ -189,19 +260,6 @@ const tests = {
     assert.equal(hex(sockets[1].sent[0]), "07");
     sockets[1].reply(OK);
     assert.equal((await req).kind, "ok");
-  },
-
-  async "a request queued behind a timed-out one waits for the reconnect"() {
-    fresh();
-    const client = await connected();
-    const slow = client._request(new Uint8Array([1]), (r) => r.kind === "ok", 20);
-    const next = client._request(new Uint8Array([2]), (r) => r.kind === "ok", 5000);
-    await assert.rejects(slow, /timed out/);
-    await tick(2100);
-    sockets[1].open();
-    await tick();
-    sockets[1].reply(OK);
-    assert.equal((await next).kind, "ok");
   },
 
   async "waiting for a reconnect gives up after the request's timeout"() {

@@ -66,7 +66,7 @@ Connects to the node that served the page. Options:
 | Option | Default | |
 |---|---|---|
 | `url` | the page's host + `/v1/contract/command?encodingProtocol=native` | WebSocket URL |
-| `reconnect` | `true` | after losing the connection (or a request timing out), reconnect every 2 s; delegates are re-registered automatically |
+| `reconnect` | `true` | after losing the connection (or the node not answering at all after a request timed out), reconnect every 2 s; delegates are re-registered automatically |
 | `onStatus(s)` | no-op | called with `"connecting"`, `"open"` or `"closed"` |
 
 Rejects if the first connection fails; nothing is retried in that case.
@@ -134,8 +134,8 @@ else throws a `TypeError`.
 
 | Method | |
 |---|---|
-| `await h.get({ subscribe? })` | current state as `Uint8Array`, or `null` if the network doesn't have it |
-| `await h.getText({ subscribe? })` | same, decoded as UTF-8 |
+| `await h.get({ subscribe?, timeoutMs? })` | current state as `Uint8Array`, or `null` if the network doesn't have it (a network node may instead not answer: the request times out, default 30 s) |
+| `await h.getText({ subscribe?, timeoutMs? })` | same, decoded as UTF-8 |
 | `await h.put(state, { subscribe? })` | create the instance with an initial state (needs the code: embedded contracts only). The node runs your `validateState` first |
 | `await h.update(delta)` | send `UpdateData::Delta`; your `updateState` merges it. Resolves to the new summary |
 | `await h.updateState(state)` | send `UpdateData::State`, a whole proposed state |
@@ -179,9 +179,15 @@ global.
 
 - **Ordering.** Requests go out one at a time over one connection. Calling
   methods concurrently is fine: calls queue and resolve in order. Each waits up
-  to 30 s for the node. The node's replies carry no request id, so after a
-  timeout the client drops the connection (and reconnects, if enabled) rather
-  than risk taking a late reply as the answer to the next request.
+  to 30 s for the node (`get({ timeoutMs })` sets another wait). A request that
+  times out fails alone, with an `Error` whose `timedOut` is true; its late
+  answer, if one comes, is recognized and dropped. On a network node a `get`
+  for a contract nobody has put yet can go unanswered rather than come back
+  `null`, so give lookups of contracts that may not exist yet a shorter wait,
+  and treat a timeout as "not there yet". The connection is dropped (and
+  reconnects, if enabled) only if the node then answers nothing at all, not
+  even a quick query, within `FreenetClient.probeMs` (10 s); subscriptions
+  survive a timeout.
 - **Notifications** arrive at any time and go to `subscribe` callbacks, never to
   the request waiting for a reply.
 - **Large responses** (over 512 KiB) are reassembled transparently.

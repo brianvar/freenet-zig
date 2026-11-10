@@ -170,10 +170,18 @@ How the client handles responses:
 - **Matching replies.** Replies carry no request id, so the client sends one
   request at a time. A response is matched to the waiting request by kind and
   key, so unsolicited extras, such as a `SubscribeResponse` after a subscribing
-  `Get`, are ignored. An error can't be matched, so it goes to the request in
-  flight. A request that times out may still be answered later, so a timeout
-  closes the connection (and reconnects, if enabled) instead of sending the
-  next request on the same one.
+  `Get`, are ignored. A request that times out fails alone and is kept for
+  5 minutes as an orphan: a later reply only it expects is its late answer,
+  and is dropped. An error goes to the request in flight, unless it names a
+  timed-out request's contract and not the one in flight's.
+- **Liveness.** On a network node a `Get` for a contract nobody has put yet
+  can go unanswered, so a timeout alone doesn't mean the node is gone. Before
+  the next request after a timeout, the client checks: anything the node sent
+  since says it's there; otherwise it sends `NodeQueries(ConnectedPeers)`,
+  which the node answers at once (any answer counts, an error too). Nothing
+  within `FreenetClient.probeMs` (10 s): the connection is closed (and
+  reconnects, if enabled) and the request waits for the new one.
+  Subscriptions on the connection survive a timeout.
 - **Notifications** (`UpdateNotification`) go to subscribers.
 - **Large responses.** Responses over 512 KiB arrive as `StreamChunk`s of the
   serialized response, optionally preceded by a `StreamHeader`; the client
