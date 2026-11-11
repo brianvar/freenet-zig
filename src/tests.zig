@@ -575,3 +575,70 @@ test "client: put sends the code, params and state; a PutResponse or an UpdateRe
     try testing.expectError(error.NodeError, c2.put(testing.allocator, wasm, params, "x"));
     try testing.expect(std.mem.endsWith(u8, c2.lastError(), ": invalid state"));
 }
+
+const dkey: freenet.types.DelegateKey = .{ .key = @splat(0x44), .code_hash = @splat(0x55) };
+const ok_delegate = le32(0) ++ le32(1) ++ dkey.key ++ dkey.code_hash; // Ok(HostResponse::DelegateResponse { key, values })
+
+test "client: a message to a delegate, its replies and the prompts the node didn't show" {
+    var n: FakeNode = .init();
+    defer n.deinit();
+    try n.send(&(le32(0) ++ le32(3)), 1000); // Ok(HostResponse::Ok): not this request's answer
+    try n.send(&(le32(0) ++ le32(1) ++ @as([32]u8, @splat(0x66)) ++ dkey.code_hash ++ le64(0)), 1000); // another delegate's
+    // two replies and a RequestUserInput { request_id: 7, message, responses: ["Cancel", "Pay"] }
+    try n.send(&(ok_delegate ++ le64(3) ++ appMsg("one") ++ appMsg("two") ++
+        le32(1) ++ le32(7) ++ vec("Pay 5?") ++ le64(2) ++ vec("Cancel") ++ vec("Pay")), 1000);
+    var c = n.client();
+    const reply = try c.sendToDelegate(testing.allocator, dkey, "pp", "hello");
+    defer reply.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), reply.payloads.len);
+    try testing.expectEqualStrings("one", reply.payloads[0]);
+    try testing.expectEqualStrings("two", reply.payloads[1]);
+    try testing.expectEqual(@as(usize, 1), reply.prompts.len);
+    try testing.expectEqual(@as(u32, 7), reply.prompts[0].request_id);
+    try testing.expectEqualStrings("Pay 5?", reply.prompts[0].message);
+    try testing.expectEqualStrings("Pay", reply.prompts[0].labels[1]);
+    // DelegateOp(ApplicationMessages { key: DelegateKey { key, code_hash }, params, inbound: [ApplicationMessage] }), as freenet.js
+    const request = le32(0) ++ le32(0) ++ dkey.key ++ dkey.code_hash ++ vec("pp") ++ le64(1) ++ appMsg("hello");
+    try testing.expectEqualSlices(u8, &([_]u8{ 0x82, 0x80 | request.len, 0, 0, 0, 0 } ++ request), n.out.written());
+}
+
+test "client: an answer to a delegate's prompt" {
+    var n: FakeNode = .init();
+    defer n.deinit();
+    try n.send(&(ok_delegate ++ le64(1) ++ appMsg("paid")), 1000);
+    var c = n.client();
+    const reply = try c.respondToDelegate(testing.allocator, dkey, "", 7, "Pay");
+    defer reply.deinit(testing.allocator);
+    try testing.expectEqualStrings("paid", reply.payloads[0]);
+    // inbound: UserResponse(UserInputResponse { request_id, response, context })
+    const request = le32(0) ++ le32(0) ++ dkey.key ++ dkey.code_hash ++ vec("") ++ le64(1) ++ le32(1) ++ le32(7) ++ vec("Pay") ++ vec("");
+    try testing.expectEqualSlices(u8, &([_]u8{ 0x82, 0x80 | request.len, 0, 0, 0, 0 } ++ request), n.out.written());
+}
+
+test "client: a delegate's failure says why" {
+    var n: FakeNode = .init();
+    defer n.deinit();
+    // Err(RequestError(DelegateError(ExecutionError(cause))))
+    try n.send(&(le32(1) ++ le32(8) ++ le32(1) ++ le32(1) ++ vec("this delegate only answers its own web app")), 1000);
+    // Err(RequestError(DelegateError(Missing(key))))
+    try n.send(&(le32(1) ++ le32(8) ++ le32(1) ++ le32(2) ++ dkey.key ++ dkey.code_hash), 1000);
+    var c = n.client();
+    try testing.expectError(error.NodeError, c.sendToDelegate(testing.allocator, dkey, "", "whoami"));
+    try testing.expectEqualStrings("DelegateExecutionError: this delegate only answers its own web app", c.lastError());
+    try testing.expectError(error.NodeError, c.sendToDelegate(testing.allocator, dkey, "", "whoami"));
+    try testing.expect(std.mem.startsWith(u8, c.lastError(), "MissingDelegate "));
+}
+
+test "client: registering a delegate sends its code and key; Ok counts" {
+    const wasm = "\x00asm-delegate";
+    const params = "app";
+    const k = freenet.types.delegateKey(wasm, params);
+    var n: FakeNode = .init();
+    defer n.deinit();
+    try n.send(&(le32(0) ++ le32(3)), 1000); // Ok(HostResponse::Ok)
+    var c = n.client();
+    try c.registerDelegate(testing.allocator, wasm, params);
+    // DelegateOp(RegisterDelegate { delegate: Wasm(V1(Delegate { parameters, data: { data, code_hash }, key })), cipher, nonce })
+    const request = le32(0) ++ le32(1) ++ le32(0) ++ le32(0) ++ vec(params) ++ vec(wasm) ++ k.code_hash ++ k.key ++ k.code_hash ++ @as([56]u8, @splat(0));
+    try testing.expectEqualSlices(u8, &([_]u8{ 0x82, 0x80 | 126, 0, request.len, 0, 0, 0, 0 } ++ request), n.out.written());
+}

@@ -1,7 +1,7 @@
 //! A native client for the node's WebSocket API, for programs that run beside
 //! the node (a git remote helper, a CLI): read a contract's state, send it a
-//! delta. It speaks the same protocol as `js/freenet.js` (bincode over
-//! `/v1/contract/command?encodingProtocol=native`). Native only (it opens a
+//! delta, message a delegate. It speaks the same protocol as `js/freenet.js`
+//! (bincode over `/v1/contract/command?encodingProtocol=native`). Native only (it opens a
 //! TCP socket); nothing here is analyzed unless a program uses it, so Wasm
 //! modules that import `freenet` are unaffected.
 //!
@@ -9,6 +9,10 @@
 //!     defer c.close();
 //!     const state = try c.get(gpa, id) orelse return error.NoSuchContract;
 //!     defer gpa.free(state);
+//!
+//! A delegate sees a native client's messages with origin `none` (checked on
+//! freenet 0.2.156): `Delegate.requireApp` refuses them, so a delegate that
+//! serves native programs checks something else, such as a signature.
 //!
 //! Requests go out one at a time and wait for their answer, as in freenet.js:
 //! replies carry no request id. With `connectWith(..., .{ .timeout = ... })`
@@ -190,7 +194,7 @@ pub const Client = struct {
                     if (f.isNotFound(id)) return null;
                     return error.NodeError;
                 },
-                .put, .updated, .other => {},
+                .put, .updated, .delegate, .ok, .other => {},
             }
         }
     }
@@ -218,7 +222,7 @@ pub const Client = struct {
             switch (try c.parse(msg)) {
                 .updated => |u| if (std.mem.eql(u8, &u.key.id, &id)) return gpa.dupe(u8, u.summary),
                 .failure => return error.NodeError,
-                .get, .put, .not_found, .other => {},
+                .get, .put, .not_found, .delegate, .ok, .other => {},
             }
         }
     }
@@ -253,7 +257,103 @@ pub const Client = struct {
                 .put => |k| if (std.mem.eql(u8, &k.id, &id)) return,
                 .updated => |u| if (std.mem.eql(u8, &u.key.id, &id)) return,
                 .failure => return error.NodeError,
-                .get, .not_found, .other => {},
+                .get, .not_found, .delegate, .ok, .other => {},
+            }
+        }
+    }
+
+    // ---- delegates ----
+
+    /// Registers the delegate `wasm` with `parameters` on the node (as
+    /// freenet.js `delegate(name)` does for a page). A node that refuses (it
+    /// may already have it) is `error.NodeError`, see `lastError`; messages
+    /// tell whether the delegate answers.
+    pub fn registerDelegate(c: *Client, gpa: Allocator, wasm: []const u8, parameters: []const u8) Error!void {
+        const key = types.delegateKey(wasm, parameters);
+        // ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate { delegate: DelegateContainer::Wasm(V1(Delegate {
+        //   parameters, data: DelegateCode { data, code_hash }, key: DelegateKey { key, code_hash } })), cipher, nonce })
+        var head: [4 * 4 + 8]u8 = undefined;
+        @memcpy(head[0..16], &[_]u8{ 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+        std.mem.writeInt(u64, head[16..24], parameters.len, .little);
+        var wasm_len: [8]u8 = undefined;
+        std.mem.writeInt(u64, &wasm_len, wasm.len, .little);
+        const cipher_nonce: [32 + 24]u8 = @splat(0); // ignored by current nodes
+        c.arm();
+        c.sendParts(&.{ &head, parameters, &wasm_len, wasm, &key.code_hash, &key.key, &key.code_hash, &cipher_nonce }) catch |err| return c.ioError(err);
+
+        var streams: Reassembly = .{};
+        defer streams.deinit(gpa);
+        while (true) {
+            const msg = c.receive(gpa, &streams) catch |err| return c.ioError(err);
+            defer gpa.free(msg);
+            switch (try c.parse(msg)) {
+                .ok => return,
+                .delegate => |d| if (std.mem.eql(u8, &d.key, &key.key)) return,
+                .failure => return error.NodeError,
+                .get, .put, .not_found, .updated, .other => {},
+            }
+        }
+    }
+
+    /// Sends `payload` to the delegate `key` (with its `parameters`) as an
+    /// `ApplicationMessage`, as freenet.js `DelegateHandle.send` does. The
+    /// node runs the delegate and returns what it sent back: its replies and,
+    /// from a node that doesn't show prompts itself (local mode), its
+    /// questions for the user. A delegate's own failure is
+    /// `error.NodeError`, its message in `lastError`. Free the result with
+    /// `deinit`.
+    pub fn sendToDelegate(c: *Client, gpa: Allocator, key: types.DelegateKey, parameters: []const u8, payload: []const u8) Error!DelegateReply {
+        // InboundDelegateMsg::ApplicationMessage { payload, context: [], processed: false }
+        var head: [4 + 8]u8 = undefined;
+        std.mem.writeInt(u32, head[0..4], 0, .little);
+        std.mem.writeInt(u64, head[4..12], payload.len, .little);
+        const tail: [9]u8 = @splat(0);
+        return c.delegateRequest(gpa, key, parameters, &.{ &head, payload, &tail });
+    }
+
+    /// Answers a delegate's question (`DelegateReply.prompts`) with the
+    /// chosen label, "" for none: an `InboundDelegateMsg::UserResponse`, as
+    /// freenet.js `DelegateHandle.respond`. The delegate can't tell this
+    /// answer from a person's.
+    pub fn respondToDelegate(c: *Client, gpa: Allocator, key: types.DelegateKey, parameters: []const u8, request_id: u32, label: []const u8) Error!DelegateReply {
+        // InboundDelegateMsg::UserResponse(UserInputResponse { request_id, response, context: [] })
+        var head: [4 + 4 + 8]u8 = undefined;
+        std.mem.writeInt(u32, head[0..4], 1, .little);
+        std.mem.writeInt(u32, head[4..8], request_id, .little);
+        std.mem.writeInt(u64, head[8..16], label.len, .little);
+        const tail: [8]u8 = @splat(0);
+        return c.delegateRequest(gpa, key, parameters, &.{ &head, label, &tail });
+    }
+
+    fn delegateRequest(c: *Client, gpa: Allocator, key: types.DelegateKey, parameters: []const u8, inbound: []const []const u8) Error!DelegateReply {
+        // ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { key: DelegateKey, params, inbound: [one] })
+        var head: [8 + 64 + 8]u8 = undefined;
+        @memcpy(head[0..8], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+        @memcpy(head[8..40], &key.key);
+        @memcpy(head[40..72], &key.code_hash);
+        std.mem.writeInt(u64, head[72..80], parameters.len, .little);
+        var parts: [6][]const u8 = undefined;
+        parts[0] = &head;
+        parts[1] = parameters;
+        parts[2] = &[_]u8{ 1, 0, 0, 0, 0, 0, 0, 0 }; // one inbound message
+        @memcpy(parts[3..][0..inbound.len], inbound);
+        c.arm();
+        c.sendParts(parts[0 .. 3 + inbound.len]) catch |err| return c.ioError(err);
+
+        var streams: Reassembly = .{};
+        defer streams.deinit(gpa);
+        while (true) {
+            const msg = c.receive(gpa, &streams) catch |err| return c.ioError(err);
+            defer gpa.free(msg);
+            switch (try c.parse(msg)) {
+                .delegate => |d| if (std.mem.eql(u8, &d.key, &key.key)) {
+                    return DelegateReply.decode(gpa, d.values) catch |err| switch (err) {
+                        error.OutOfMemory => error.OutOfMemory,
+                        else => error.BadResponse,
+                    };
+                },
+                .failure => return error.NodeError,
+                .get, .put, .not_found, .updated, .ok, .other => {},
             }
         }
     }
@@ -309,6 +409,10 @@ pub const Client = struct {
         put: Key,
         not_found: [32]u8,
         updated: struct { key: Key, summary: []const u8 },
+        /// HostResponse::DelegateResponse: `values` is the encoded Vec<OutboundDelegateMsg>.
+        delegate: struct { key: [32]u8, values: []const u8 },
+        /// HostResponse::Ok (a registered delegate, among others).
+        ok,
         failure: Failure,
         other,
     };
@@ -690,6 +794,86 @@ fn applyMask(data: []u8, mask: [4]u8, offset: usize) void {
 
 // ---- responses ----
 
+/// What a delegate sent back for one message (`Client.sendToDelegate`).
+pub const DelegateReply = struct {
+    /// Its replies (`OutboundDelegateMsg::ApplicationMessage` payloads), in order.
+    payloads: []const []const u8,
+    /// Its questions for the user that the node didn't show itself (a node in
+    /// local mode hands them to the client): answer with `respondToDelegate`.
+    prompts: []const Prompt,
+
+    pub const Prompt = struct {
+        request_id: u32,
+        message: []const u8,
+        /// The answers offered, as the delegate named them.
+        labels: []const []const u8,
+    };
+
+    pub fn deinit(r: DelegateReply, gpa: Allocator) void {
+        for (r.payloads) |p| gpa.free(p);
+        gpa.free(r.payloads);
+        for (r.prompts) |p| {
+            gpa.free(p.message);
+            for (p.labels) |l| gpa.free(l);
+            gpa.free(p.labels);
+        }
+        gpa.free(r.prompts);
+    }
+
+    /// Decodes a Vec<OutboundDelegateMsg>, as freenet.js does: replies and
+    /// prompts; it stops at any other variant (none is meant for the client).
+    fn decode(gpa: Allocator, values: []const u8) (bincode.Error || Allocator.Error)!DelegateReply {
+        var arena: std.heap.ArenaAllocator = .init(gpa); // only for the lists while decoding
+        defer arena.deinit();
+        var payloads: std.ArrayList([]const u8) = .empty;
+        var prompts: std.ArrayList(Prompt) = .empty;
+        errdefer {
+            const partial: DelegateReply = .{ .payloads = payloads.items, .prompts = prompts.items };
+            for (partial.payloads) |p| gpa.free(p);
+            for (partial.prompts) |p| {
+                gpa.free(p.message);
+                for (p.labels) |l| gpa.free(l);
+                gpa.free(p.labels);
+            }
+        }
+        var r: bincode.Reader = .init(values);
+        const n = try r.int(u64);
+        var i: u64 = 0;
+        while (i < n) : (i += 1) {
+            switch (try r.tag()) {
+                0 => { // ApplicationMessage { payload, context, processed }
+                    const payload = try r.bytes();
+                    _ = try r.bytes();
+                    _ = try r.int(u8);
+                    try payloads.ensureUnusedCapacity(arena.allocator(), 1);
+                    payloads.appendAssumeCapacity(try gpa.dupe(u8, payload));
+                },
+                1 => { // RequestUserInput { request_id, message, responses: Vec<ClientResponse> }
+                    const request_id = try r.int(u32);
+                    const message = try r.bytes();
+                    const count = try r.int(u64);
+                    if (count > r.remaining() / 8) return error.EndOfStream;
+                    const labels = try gpa.alloc([]const u8, @intCast(count));
+                    var made: usize = 0;
+                    errdefer {
+                        for (labels[0..made]) |l| gpa.free(l);
+                        gpa.free(labels);
+                    }
+                    while (made < labels.len) : (made += 1) labels[made] = try gpa.dupe(u8, try r.bytes());
+                    const msg_copy = try gpa.dupe(u8, message);
+                    errdefer gpa.free(msg_copy);
+                    try prompts.append(arena.allocator(), .{ .request_id = request_id, .message = msg_copy, .labels = labels });
+                },
+                else => break,
+            }
+        }
+        const out_payloads = try gpa.dupe([]const u8, payloads.items);
+        errdefer gpa.free(out_payloads);
+        const out_prompts = try gpa.dupe(Prompt, prompts.items);
+        return .{ .payloads = out_payloads, .prompts = out_prompts };
+    }
+};
+
 /// A `ClientError` from the node, as freenet.js names it: `kind` is the
 /// node's variant name.
 const Failure = struct {
@@ -721,7 +905,16 @@ const error_kinds = [_][]const u8{ "ChannelClosed", "DeserializationError", "Dis
 fn decodeResponse(msg: []const u8) bincode.Error!Client.Response {
     var r: bincode.Reader = .init(msg);
     if (try r.tag() != 0) return .{ .failure = decodeClientError(&r) catch .{ .kind = "Unknown" } };
-    if (try r.tag() != 0) return .other; // not a ContractResponse
+    switch (try r.tag()) {
+        0 => {}, // ContractResponse, below
+        1 => { // DelegateResponse { key: DelegateKey { key, code_hash }, values }
+            const key = try r.array(32);
+            _ = try r.raw(32);
+            return .{ .delegate = .{ .key = key, .values = r.buf[r.pos..] } };
+        },
+        3 => return .ok,
+        else => return .other,
+    }
     switch (try r.tag()) {
         0 => { // GetResponse { key, contract: Option<ContractContainer>, state }
             const key = try decodeKey(&r);
@@ -771,7 +964,29 @@ fn decodeClientError(r: *bincode.Reader) bincode.Error!Failure {
                     f.contract = try r.array(32);
                 } else f.kind = "ContractError";
             },
-            1 => f.kind = "DelegateError",
+            1 => switch (try r.tag()) { // DelegateError, named as freenet.js names them
+                0 => { // RegisterError(DelegateKey { key, code_hash })
+                    f.kind = "RegisterError";
+                    f.contract = try r.array(32);
+                    _ = try r.raw(32);
+                },
+                1 => { // ExecutionError(cause): the delegate's own message
+                    f.kind = "DelegateExecutionError";
+                    f.cause = try r.bytes();
+                },
+                2 => { // Missing(DelegateKey { key, code_hash })
+                    f.kind = "MissingDelegate";
+                    f.contract = try r.array(32);
+                    _ = try r.raw(32);
+                },
+                3 => { // MissingSecret { key: DelegateKey, secret }
+                    f.kind = "MissingSecret";
+                    f.contract = try r.array(32);
+                    _ = try r.raw(32);
+                    f.cause = try r.bytes();
+                },
+                else => f.kind = "DelegateError",
+            },
             2 => f.kind = "Disconnect",
             3 => f.kind = "Timeout",
             else => {},
