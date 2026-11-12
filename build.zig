@@ -29,7 +29,7 @@ pub fn build(b: *Build) void {
 
     // Library tests (native) + the built-in web container checked as Wasm.
     const test_step = b.step("test", "Run the library's tests");
-    for ([_][]const u8{ "src/freenet.zig", "tools/check_wasm.zig" }) |path| {
+    for ([_][]const u8{ "src/freenet.zig", "tools/check_wasm.zig", "tools/pack.zig" }) |path| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(path),
             .target = target,
@@ -214,6 +214,50 @@ pub fn addAppId(b: *Build, dep: *Build.Dependency, signing_key: []const u8) Buil
     run.has_side_effects = true; // the key is read from outside the build
     run.addArg("--app-id-out");
     return run.addOutputFileArg2("app_id.txt", .{});
+}
+
+pub const SignedArchiveOptions = struct {
+    /// The signing key's name (or a key file), as for `addWebApp`. Give it a
+    /// key of its own: the same key and container make the same id, so a key
+    /// that also signs a web app would put both at one address.
+    signing_key: []const u8,
+    /// A stored .xz around a tar (`freenet.webapp.xzStore(freenet.webapp.tar(...))`),
+    /// made by the build. Signed as it is: nothing is added or rewritten.
+    archive: Build.LazyPath,
+    /// Release number; each must be higher than the one before. Default: the
+    /// Unix time of the build.
+    version: ?u32 = null,
+};
+
+pub const SignedArchive = struct {
+    /// The web container (the same contract `addWebApp` uses).
+    contract: *Build.Step.Compile,
+    /// Output directory: web_container.wasm, state.bin, params.bin (the public
+    /// key), site.txt.
+    output: Build.LazyPath,
+};
+
+/// Signs an archive the build made into the built-in web container: files
+/// that aren't an app (downloads, a static page), at an address fixed by the
+/// key (`addAppId`), each release replacing the one before. Unlike
+/// `addWebApp`, nothing is added (no `freenet.js`) and no reference is
+/// rewritten (no `?v=`), so the archive's bytes don't depend on the release
+/// number. Like `addWebApp`, it needs the key on the building machine.
+pub fn addSignedArchive(b: *Build, dep: *Build.Dependency, options: SignedArchiveOptions) SignedArchive {
+    const contract = webContainer(b, dep);
+    const run = b.addRunArtifact(dep.artifact("freenet-pack"));
+    run.addArg("--web-contract");
+    run.addArtifactArg2(contract, .{});
+    run.addArgs(&.{ "--key", options.signing_key });
+    run.has_side_effects = true; // the key is read from outside the build
+    if (options.version) |v| {
+        run.addArg("--version");
+        run.addArg(b.fmt("{d}", .{v}));
+    }
+    run.addArg("--archive");
+    run.addFileArg(options.archive);
+    run.addArg("--out-dir");
+    return .{ .contract = contract, .output = run.addOutputDirectoryArg2("signed", .{}) };
 }
 
 pub const TestOptions = struct {

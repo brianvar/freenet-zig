@@ -8,6 +8,8 @@
 //!                [--delegate <name>=<delegate.wasm>]...
 //!                [--embed-contract <name>=<contract.wasm>]...
 //!   freenet-pack --web-contract <web_container.wasm> --key <key file> --app-id-out <file>
+//!   freenet-pack --web-contract <web_container.wasm> --key <key file> [--version <n>]
+//!                --archive <web.tar.xz> --out-dir <dir>
 //!
 //! * `--key` is the *name* of a key made by `fdev website init <name>`
 //!   (freenet-core's own tool). It is looked up where `fdev` keeps it,
@@ -35,6 +37,13 @@
 //! With `--app-id-out`, it only writes the app's id (base58, as in URLs) to
 //! that file. The id doesn't depend on the site, so a build can know it before
 //! the page exists (`addAppId`), for instance to link to the app from elsewhere.
+//!
+//! With `--archive`, it signs an archive the build made itself (a stored .xz
+//! around a tar, as `webapp.xzStore(webapp.tar(...))` writes it) as it is: no
+//! `freenet.js`, no `?v=` references, so the archive's bytes, and a hash of
+//! them, don't depend on the release number (`addSignedArchive`). For files
+//! that aren't an app: downloads, a static page. Writes web_container.wasm,
+//! state.bin, params.bin and site.txt.
 
 const std = @import("std");
 const Io = std.Io;
@@ -57,6 +66,7 @@ pub fn main(init: std.process.Init) !void {
     var client_path: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var app_id_out: ?[]const u8 = null;
+    var archive_path: ?[]const u8 = null;
     var files: std.ArrayList(Named) = .empty;
     var delegates: std.ArrayList(Named) = .empty;
     var contracts: std.ArrayList(Named) = .empty;
@@ -77,6 +87,8 @@ pub fn main(init: std.process.Init) !void {
             key_path = value;
         } else if (std.mem.eql(u8, arg, "--app-id-out")) {
             app_id_out = value;
+        } else if (std.mem.eql(u8, arg, "--archive")) {
+            archive_path = value;
         } else if (std.mem.eql(u8, arg, "--version")) {
             version = std.fmt.parseInt(u32, value, 10) catch return usage("--version must be a whole number above 0, got {s}", .{value});
             if (version.? == 0) return usage("--version must be above 0", .{});
@@ -90,6 +102,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (app_id_out != null) {
         if (contract_path == null or key_path == null) return usage("--app-id-out needs --web-contract and --key", .{});
+    } else if (archive_path != null) {
+        if (contract_path == null or out_dir == null or key_path == null) return usage("--archive needs --web-contract, --key and --out-dir", .{});
+        if (client_path != null or files.items.len + delegates.items.len + contracts.items.len > 0)
+            return usage("--archive signs the archive as it is: no --client, --file, --delegate or --embed-contract", .{});
     } else if (contract_path == null or client_path == null or out_dir == null or key_path == null)
         return usage("--web-contract, --client, --key and --out-dir are required", .{});
 
@@ -111,6 +127,30 @@ pub fn main(init: std.process.Init) !void {
     if (app_id_out) |path| {
         var id_b58: [64]u8 = undefined;
         return Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = freenet.types.encodeBase58(&id_b58, &app_id) });
+    }
+    if (archive_path) |path| {
+        const release = version orelse try unixTime(io);
+        const state = signArchive(arena, key_pair, release, try read(io, arena, path)) catch |err| switch (err) {
+            error.NotXz => return usage("{s} isn't an .xz archive (webapp.xzStore writes one)", .{path}),
+            error.TooLarge => return usage("{s} makes a state over the {d} bytes the node stores", .{ path, freenet.webapp.max_state_size }),
+            else => |e| return e,
+        };
+        var b58: [64]u8 = undefined;
+        const key = freenet.types.encodeBase58(&b58, &app_id);
+        try cwd.createDirPath(io, out_dir.?);
+        var dir = try cwd.openDir(io, out_dir.?, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{ .sub_path = "web_container.wasm", .data = contract_wasm });
+        try dir.writeFile(io, .{ .sub_path = "state.bin", .data = state });
+        try dir.writeFile(io, .{ .sub_path = "params.bin", .data = &public_key });
+        try dir.writeFile(io, .{ .sub_path = "site.txt", .data = try arena.print(
+            \\contract key: {s}
+            \\local URL:    http://127.0.0.1:7509/v1/contract/web/{s}/
+            \\release:      {d}
+            \\state size:   {d} bytes
+            \\
+        , .{ key, key, release, state.len }) });
+        return;
     }
 
     // freenet.js = the client + the embedded delegates and contracts.
@@ -193,6 +233,34 @@ pub fn main(init: std.process.Init) !void {
     , .{ key, key, release, state.len, key_lines.written() }) });
 }
 
+/// The web-container state for `archive` as it is (`--archive`): signed as
+/// release `version`, nothing added. Only a stored .xz (by its magic; the node
+/// reads it), and no larger than the node stores.
+pub fn signArchive(gpa: std.mem.Allocator, key_pair: Ed25519.KeyPair, version: u32, archive: []const u8) ![]u8 {
+    if (!std.mem.startsWith(u8, archive, "\xFD7zXZ\x00")) return error.NotXz;
+    const state = try freenet.webapp.signState(gpa, key_pair, version, archive);
+    if (state.len > freenet.webapp.max_state_size) {
+        gpa.free(state);
+        return error.TooLarge;
+    }
+    return state;
+}
+
+test "signArchive: the archive as it is, valid for the web container with the key as parameters" {
+    const a = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@splat(3));
+    const tar = try freenet.webapp.tar(a, &.{ .{ .name = "install.sh", .data = "#!/bin/sh\n" }, .{ .name = "tool-linux", .data = "\x7fELF" } });
+    defer a.free(tar);
+    const archive = try freenet.webapp.xzStore(a, tar);
+    defer a.free(archive);
+    const state = try signArchive(a, kp, 7, archive);
+    defer a.free(state);
+    const parsed = try freenet.webapp.parseState(state);
+    try std.testing.expectEqualSlices(u8, archive, parsed.archive); // nothing added or rewritten
+    try std.testing.expectEqual(@as(u32, 7), (try freenet.webapp.verifyState(kp.public_key.toBytes(), state)).version);
+    try std.testing.expectError(error.NotXz, signArchive(a, kp, 7, tar));
+}
+
 /// Where `fdev website init` keeps key `name`: `dirs::config_dir()` +
 /// `freenet/website-keys/<name>.toml`.
 fn keyFilePath(arena: std.mem.Allocator, env: anytype, name: []const u8) ![]const u8 {
@@ -268,6 +336,7 @@ fn usage(comptime fmt: []const u8, args: anytype) error{InvalidArgs} {
         \\                    --file index.html=<path> [--file <name>=<path>]...
         \\                    [--delegate <name>=<wasm>]... [--embed-contract <name>=<wasm>]...
         \\       freenet-pack --web-contract <wasm> --key <key file> --app-id-out <file>
+        \\       freenet-pack --web-contract <wasm> --key <key file> [--version <n>] --archive <web.tar.xz> --out-dir <dir>
         \\
     , .{});
     return error.InvalidArgs;

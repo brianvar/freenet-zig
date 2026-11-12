@@ -4,6 +4,13 @@ What changed, and what breaks. Newest first.
 
 ## Unreleased
 
+- **build: `addSignedArchive`.** Signs an archive the build made itself into
+  the built-in web container (freenet-pack `--archive`): files that aren't an
+  app, at an address fixed by the key (`addAppId`), each release replacing
+  the one before. Nothing is added (no `freenet.js`) and no reference
+  rewritten (no `?v=`), so the archive's bytes don't depend on the release
+  number. docs/build.md. Breaks nothing.
+
 - **freenet.js: a lane that doesn't open in time is given up.** A browser
   opens only so many WebSockets to one host and holds the rest in
   CONNECTING, with no error, so on a page with several clients a contract

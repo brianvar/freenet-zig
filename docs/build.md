@@ -53,6 +53,26 @@ page is built (it depends only on the key and the web container). Use it to put
 a link back to the app (`/v1/contract/web/<id>/`) into content the app creates.
 Needs the key, like `addWebApp`.
 
+### addSignedArchive
+
+```zig
+const tools = freenet.addSignedArchive(b, dep, .{
+    .signing_key = "myapp-tools", // a key of its own: not the app's
+    .archive = my_archive,        // LazyPath: a stored .xz around a tar, made by the build
+});
+// tools.output: web_container.wasm, state.bin, params.bin, site.txt
+```
+
+Signs an archive the build made itself into the built-in web container, for
+files that aren't an app: downloads, a static page. The address is
+`addAppId(b, dep, "myapp-tools")`: fixed by the key, so it stays the same
+across releases, and each release (`.version`, default the Unix time)
+replaces the one before; an older one is refused. Nothing is added to the
+archive (no `freenet.js`) and no reference is rewritten (no `?v=`), so a hash
+of the archive doesn't depend on the release number. Build the archive with
+`freenet.webapp.xzStore(freenet.webapp.tar(files))`. Use a key of its own:
+the same key and container are the same address as the app signed with it.
+
 ### addTests
 
 ```zig
@@ -81,9 +101,14 @@ freenet-pack --web-contract <web_container.wasm> --client <freenet.js> --out-dir
              [--delegate <name>=<delegate.wasm>]...
              [--embed-contract <name>=<contract.wasm>]...
 freenet-pack --web-contract <web_container.wasm> --key <key name> --app-id-out <file>
+freenet-pack --web-contract <web_container.wasm> --key <key name> [--version <n>]
+             --archive <web.tar.xz> --out-dir <dir>
 ```
 
 The second form only writes the app's id (base58) to `<file>` (`addAppId`).
+The third signs `<web.tar.xz>` as it is (`addSignedArchive`) and writes
+`web_container.wasm`, `state.bin`, `params.bin` and `site.txt`; it fails if the
+file isn't an .xz or the state would be over 50 MiB.
 
 1. Reads the signing key and computes the app's id: the contract key,
    BLAKE3(BLAKE3(web container code) ‖ public key).

@@ -335,6 +335,10 @@ Consequences:
   `try d.requireApp()` (see [delegates.md](delegates.md#origin-whos-asking)).
   Users of other sites on the same node can't use your delegates.
 
+The same container signs other files at a fixed address too: `addSignedArchive`
+(see [build.md](build.md#addsignedarchive)) for downloads or a static page,
+with a key of its own.
+
 The layout helpers in `freenet.webapp` (`tar`, `xzStore`, `buildState`,
 `parseState`, `signState`, `verifyState`) help if you write your own container.
 
