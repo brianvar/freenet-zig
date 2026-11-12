@@ -48,6 +48,17 @@ class FreenetClient {
   /** How long a lane stays open with nothing to do. */
   static laneIdleMs = 60000;
   /**
+   * How long a lane may take to open. A browser opens only so many
+   * WebSockets to one host at once and holds the rest in CONNECTING (a page
+   * with several clients, or several tabs, reaches it), so a lane that isn't
+   * open by then is given up (its socket closed, freeing the browser's slot),
+   * its request goes out on the main connection, and the client opens no
+   * lanes for `laneBackoffMs`.
+   */
+  static laneOpenMs = 3000;
+  /** How long a client uses only its main connection after a lane didn't open in time. */
+  static laneBackoffMs = 60000;
+  /**
    * How often the main connection, when nothing else went over it, asks the
    * node something every node answers at once (NodeQueries: ConnectedPeers),
    * so an idle connection isn't dropped (and a node that is gone is noticed:
@@ -81,6 +92,7 @@ class FreenetClient {
     this._lastActive = 0;            // when anything last went out or came in
     this._laneCount = Math.max(0, Math.floor(lanes) || 0);
     this._lanes = [];                // index -> { client, ready, busy, timer }: see _contractRequest
+    this._lanesOffUntil = 0;         // no new lanes before this (Date.now()): a lane didn't open in time
     this._inflight = null;           // the request awaiting an answer (one at a time)
     this._queue = Promise.resolve(); // serializes requests
     this._registered = new Map();    // delegate name -> Promise<DelegateHandle>
@@ -460,20 +472,36 @@ class FreenetClient {
   // itself, but not reconnecting: a lane the node drops is replaced by a new
   // one when next needed, and a get that was out on it is sent again, once),
   // opened when first needed and closed after `laneIdleMs` with nothing to
-  // do. If it can't be opened, the request goes out on the main connection.
+  // do. If it can't be opened, or isn't open within `laneOpenMs`, the request
+  // goes out on the main connection (and no lane opens for `laneBackoffMs`).
   async _contractRequest(id, bytes, expects, timeoutMs, contract, { retry = false } = {}) {
     if (!this._laneCount || this._closing) return this._request(bytes, expects, timeoutMs, contract);
     const i = id[0] % this._laneCount;
     let lane = this._lanes[i];
+    if (!lane && Date.now() < this._lanesOffUntil) return this._request(bytes, expects, timeoutMs, contract);
     if (!lane) {
       let made = null;
       const client = new FreenetClient({
         url: this.url, reconnect: false, lanes: 0, keepAliveMs: 0, name: `lane ${i + 1}`,
         onStatus: (s) => { if (s === "closed" && made && this._lanes[i] === made) { clearTimeout(made.timer); this._lanes[i] = null; } },
       });
-      lane = made = { client, ready: client._open(), busy: 0, timer: null };
+      const opening = client._open();
+      // not open in time: given up, its socket closed (freeing the browser's slot)
+      const late = new Promise((_, reject) => {
+        const t = setTimeout(() => reject(new Error("the lane didn't open in time")), FreenetClient.laneOpenMs);
+        opening.then(() => clearTimeout(t), () => clearTimeout(t));
+      });
+      lane = made = { client, ready: Promise.race([opening, late]), busy: 0, timer: null };
       this._lanes[i] = lane;
-      lane.ready.catch(() => { if (this._lanes[i] === made) this._lanes[i] = null; });
+      lane.ready.catch((err) => {
+        if (this._lanes[i] === made) this._lanes[i] = null;
+        if (client._isOpen()) return;
+        client.close();
+        if (Date.now() >= this._lanesOffUntil) {
+          console.warn(`freenet.js (${this.name}): ${err.message === "the lane didn't open in time" ? `a lane didn't open within ${FreenetClient.laneOpenMs / 1000} s` : "a lane couldn't open"}; contract requests use the main connection for ${FreenetClient.laneBackoffMs / 1000} s`);
+        }
+        this._lanesOffUntil = Date.now() + FreenetClient.laneBackoffMs;
+      });
     }
     lane.busy++;
     clearTimeout(lane.timer);

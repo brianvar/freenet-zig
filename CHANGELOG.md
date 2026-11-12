@@ -4,6 +4,16 @@ What changed, and what breaks. Newest first.
 
 ## Unreleased
 
+- **freenet.js: a lane that doesn't open in time is given up.** A browser
+  opens only so many WebSockets to one host and holds the rest in
+  CONNECTING, with no error, so on a page with several clients a contract
+  request waited for its lane until some other socket closed (minutes: a
+  load test of 16 clients in one page stalled). Now a lane not open within
+  `FreenetClient.laneOpenMs` (3 s) is closed, its request goes out on the
+  main connection, and the client opens no lanes for
+  `FreenetClient.laneBackoffMs` (60 s); a warning says so. A page with
+  several clients should pass `lanes: 0` to all but one. Breaks nothing.
+
 - **delegates: `d.subscribeContract(id)`.** Sends a
   `SubscribeContractRequest`: the node keeps the contract for the delegate,
   across restarts, and calls it with each new state (`.unsupported`, tag 6;

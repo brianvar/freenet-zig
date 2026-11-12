@@ -448,6 +448,36 @@ const tests = {
     client.close();
   },
 
+  async "a lane that doesn't open in time is given up: its request goes on the main connection, and no lane opens for a while"() {
+    fresh();
+    FreenetClient.contracts = { c: { wasm: "AA==", codeHash: "33".repeat(32) } };
+    FreenetClient.laneOpenMs = 30;
+    try {
+      const client = await connected({ reconnect: false, lanes: 2 });
+      const h = client.contract("c", "p");
+      const got = h.get();
+      await tick();
+      assert.equal(sockets.length, 2, "a lane is opening");
+      const stuck = sockets[1]; // never opens (a browser holding it in CONNECTING)
+      await until(() => sockets[0].sent.length === 1, 1000);
+      assert.equal(stuck.readyState, 3, "the stuck lane's socket is closed");
+      sockets[0].reply(getResponse("main", cat(h.id, CODE_HASH)));
+      assert.equal(text(await got), "main", "answered on the main connection");
+      // another contract, during the back-off: straight to the main connection, no new lane
+      let other;
+      for (let i = 0; !other; i++) { const x = client.contract("c", "q" + i); if (x.id[0] % 2 !== h.id[0] % 2) other = x; }
+      const got2 = other.get();
+      await until(() => sockets[0].sent.length === 2);
+      assert.equal(sockets.length, 2, "no lane opened during the back-off");
+      sockets[0].reply(getResponse("main2", cat(other.id, CODE_HASH)));
+      assert.equal(text(await got2), "main2");
+      assert.ok(client._lanesOffUntil > Date.now(), "the back-off runs");
+      client.close();
+    } finally {
+      FreenetClient.laneOpenMs = 3000;
+    }
+  },
+
   async "a lane the node drops is replaced, and a get on it is sent again"() {
     fresh();
     FreenetClient.contracts = { c: { wasm: "AA==", codeHash: "33".repeat(32) } };

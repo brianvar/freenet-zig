@@ -193,7 +193,13 @@ global.
   picks its lane, so every get, put and update of one contract stays in the
   order the page made them (a write and a later read can't pass each other),
   while different contracts go out at once: on a network node one lookup of
-  a contract nobody has (seconds) no longer holds up the rest. Delegate
+  a contract nobody has (seconds) no longer holds up the rest. A browser
+  opens only so many WebSockets to one host and holds the rest in
+  CONNECTING, so a lane not open within `FreenetClient.laneOpenMs` (3 s) is
+  given up: its request goes out on the main connection, and the client
+  opens no lanes for `FreenetClient.laneBackoffMs` (60 s). A page with
+  several clients (or a connection that only subscribes) should pass
+  `lanes: 0` to all but one. Delegate
   messages, subscriptions and a `get`/`put` with `subscribe: true` go out on
   the main connection, one at a time; notifications arrive there. Calling
   methods concurrently is fine: calls queue and resolve in order. Each waits up
