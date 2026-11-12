@@ -232,11 +232,25 @@ pub const Client = struct {
     /// the state in instead, which counts too (as freenet.js `put`). A
     /// refused state is `error.NodeError` (see `lastError`).
     pub fn put(c: *Client, gpa: Allocator, wasm: []const u8, parameters: []const u8, state: []const u8) Error!void {
+        return c.putWith(gpa, wasm, parameters, state, .{});
+    }
+
+    pub const PutOptions = struct {
+        /// Subscribe this connection to the contract as part of the put (as
+        /// freenet.js `put(state, { subscribe: true })`). The node keeps a
+        /// contract hosted while a client is subscribed to it, but the
+        /// subscription ends when this connection closes, so it's worth it
+        /// only for a client that stays connected.
+        subscribe: bool = false,
+    };
+
+    /// `put` with options.
+    pub fn putWith(c: *Client, gpa: Allocator, wasm: []const u8, parameters: []const u8, state: []const u8, options: PutOptions) Error!void {
         const code_hash = types.codeHash(wasm);
         const id = types.contractInstanceId(wasm, parameters);
         // ClientRequest::ContractOp(ContractRequest::Put { contract: Wasm(V1(WrappedContract {
         //   data: ContractCode { data, code_hash }, params, key: ContractKey { instance, code } })),
-        //   state, related_contracts: empty, subscribe: false, blocking_subscribe: false })
+        //   state, related_contracts: empty, subscribe, blocking_subscribe: false })
         var head: [4 + 4 + 4 + 4 + 8]u8 = undefined;
         @memcpy(head[0..16], &[_]u8{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
         std.mem.writeInt(u64, head[16..24], wasm.len, .little);
@@ -244,7 +258,7 @@ pub const Client = struct {
         std.mem.writeInt(u64, &params_len, parameters.len, .little);
         var state_len: [8]u8 = undefined;
         std.mem.writeInt(u64, &state_len, state.len, .little);
-        const tail = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // related_contracts: u64 0 entries; subscribe; blocking_subscribe
+        const tail = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, @intFromBool(options.subscribe), 0 }; // related_contracts: u64 0 entries; subscribe; blocking_subscribe
         c.arm();
         c.sendParts(&.{ &head, wasm, &code_hash, &params_len, parameters, &id, &code_hash, &state_len, state, &tail }) catch |err| return c.ioError(err);
 

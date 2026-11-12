@@ -4,6 +4,12 @@ What changed, and what breaks. Newest first.
 
 ## Unreleased
 
+- **client: `putWith(..., .{ .subscribe = true })`.** The Zig client's put can
+  subscribe its connection to the contract, as freenet.js `put(state, {
+  subscribe: true })` does; `put` is `putWith` with the defaults (no
+  subscribe), as before. The subscription ends when the connection closes.
+  Breaks nothing.
+
 - **freenet.js: `follow(fn, { resubscribeMs })`.** The shortest time between
   two Subscribes with a new summary (default 0: one after each burst, as
   before). A contract that changes several times a second got a Subscribe

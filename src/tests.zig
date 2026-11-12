@@ -576,6 +576,21 @@ test "client: put sends the code, params and state; a PutResponse or an UpdateRe
     try testing.expect(std.mem.endsWith(u8, c2.lastError(), ": invalid state"));
 }
 
+test "client: putWith subscribe sets the subscribe byte, as freenet.js put(state, { subscribe: true })" {
+    const wasm = "\x00asm-code";
+    const params = "pp";
+    const put_id = freenet.types.contractInstanceId(wasm, params);
+    const put_hash = freenet.types.codeHash(wasm);
+    // the same Put, with subscribe: true, blocking_subscribe: false
+    const request = le32(1) ++ le32(0) ++ le32(0) ++ le32(0) ++ vec(wasm) ++ put_hash ++ vec(params) ++ put_id ++ put_hash ++ vec("state") ++ [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 1, 0 };
+    var n: FakeNode = .init();
+    defer n.deinit();
+    try n.send(&(ok_contract ++ le32(1) ++ put_id ++ put_hash), 1000);
+    var c = n.client();
+    try c.putWith(testing.allocator, wasm, params, "state", .{ .subscribe = true });
+    try testing.expectEqualSlices(u8, &([_]u8{ 0x82, 0x80 | 126, 0, request.len, 0, 0, 0, 0 } ++ request), n.out.written());
+}
+
 const dkey: freenet.types.DelegateKey = .{ .key = @splat(0x44), .code_hash = @splat(0x55) };
 const ok_delegate = le32(0) ++ le32(1) ++ dkey.key ++ dkey.code_hash; // Ok(HostResponse::DelegateResponse { key, values })
 
