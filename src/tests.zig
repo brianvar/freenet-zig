@@ -248,6 +248,57 @@ test "delegate: testing harness shows contract requests and answers them" {
     try testing.expectEqualStrings("a contract request's context is at most 400 KiB", big.err);
 }
 
+const Subscriber = struct {
+    pub fn handle(d: *freenet.Delegate, msg: freenet.Inbound) !void {
+        switch (msg) {
+            .application => {
+                try d.reply("kept");
+                try d.getContract(@splat(5), "n1");
+                try d.subscribeContract(@splat(7));
+                try d.subscribeContract(@splat(8));
+            },
+            // tag 5: the node's SubscribeContractResponse; tag 6: a ContractNotification
+            .unsupported => |u| try d.replyFmt("tag {d}", .{u.tag}),
+            .user_response, .contract_state => {},
+        }
+    }
+};
+
+test "delegate: SubscribeContractRequest bytes (after the replies and reads, not processed)" {
+    t.reset();
+    const out = t.raw.callDelegate(Subscriber, "", &web_origin, &appMsg("keep"));
+    const expected = le32(0) ++ le64(4) ++ // Ok, four messages
+        le32(0) ++ vec("kept") ++ vec("") ++ [_]u8{1} ++ // ApplicationMessage, processed
+        le32(3) ++ @as([32]u8, @splat(5)) ++ vec("n1") ++ [_]u8{0} ++ // GetContractRequest
+        le32(6) ++ @as([32]u8, @splat(7)) ++ // SubscribeContractRequest { contract_id: 32 bytes
+        vec("") ++ [_]u8{0} ++ // context: DelegateContext (empty), processed: false }
+        le32(6) ++ @as([32]u8, @splat(8)) ++ vec("") ++ [_]u8{0};
+    try testing.expectEqualSlices(u8, &expected, out);
+}
+
+test "delegate: the node's subscribe answer and notifications reach handle as .unsupported" {
+    t.reset();
+    // InboundDelegateMsg::SubscribeContractResponse (tag 5) and ContractNotification (tag 6):
+    // only the tag is read, the rest is `raw`
+    const answer = le32(5) ++ @as([32]u8, @splat(7));
+    try testing.expectEqualSlices(u8, &(le32(0) ++ le64(1) ++ le32(0) ++ vec("tag 5") ++ vec("") ++ [_]u8{1}), t.raw.callDelegate(Subscriber, "", &web_origin, &answer));
+    const note = le32(6) ++ @as([32]u8, @splat(7));
+    try testing.expectEqualSlices(u8, &(le32(0) ++ le64(1) ++ le32(0) ++ vec("tag 6") ++ vec("") ++ [_]u8{1}), t.raw.callDelegate(Subscriber, "", &web_origin, &note));
+}
+
+test "delegate: testing harness shows subscriptions" {
+    t.reset();
+    try testing.expectEqualStrings("kept", (try t.ask(Subscriber, "keep", .{}))[0]);
+    try testing.expectEqual(1, t.contractRequests().len);
+    const subs = t.subscriptions();
+    try testing.expectEqual(2, subs.len);
+    try testing.expectEqual(@as([32]u8, @splat(7)), subs[0]);
+    try testing.expectEqual(@as([32]u8, @splat(8)), subs[1]);
+    // a failed call clears them
+    _ = try t.send(Reader, .{ .application = .{ .payload = "big context" } }, .{});
+    try testing.expectEqual(0, t.subscriptions().len);
+}
+
 const Vault = struct {
     pub fn handle(d: *freenet.Delegate, msg: freenet.Inbound) !void {
         const app = switch (msg) {

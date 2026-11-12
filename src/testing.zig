@@ -19,6 +19,7 @@ const bincode = @import("bincode.zig");
 const host = @import("host.zig");
 const delegate = @import("delegate.zig");
 const contract = @import("contract.zig");
+const types = @import("types.zig");
 
 const gpa = abi.allocator;
 
@@ -30,6 +31,7 @@ pub fn reset() void {
     host.native.reset();
     last_prompts = &.{};
     last_requests = &.{};
+    last_subscriptions = &.{};
 }
 
 /// Replace the random source (for example to force edge cases).
@@ -78,12 +80,19 @@ pub const Result = union(enum) {
 
 var last_prompts: []const delegate.UserInputRequest = &.{};
 var last_requests: []const delegate.ContractRequest = &.{};
+var last_subscriptions: []const types.ContractInstanceId = &.{};
 
 /// The contract state requests (`d.getContract`) the last successful delegate
 /// call made, in order; empty after a failed call. Answer one with
 /// `contractState`.
 pub fn contractRequests() []const delegate.ContractRequest {
     return last_requests;
+}
+
+/// The contracts the last successful delegate call subscribed to
+/// (`d.subscribeContract`), in order; empty after a failed call.
+pub fn subscriptions() []const types.ContractInstanceId {
+    return last_subscriptions;
 }
 
 /// Answer a contract request the way the node does: a `GetContractResponse`
@@ -166,17 +175,19 @@ fn encodeInbound(w: *bincode.Writer, msg: delegate.Inbound) !void {
 }
 
 /// Decodes `Result<Vec<OutboundDelegateMsg>, DelegateError>` as the library
-/// writes it (`ApplicationMessage` replies, `RequestUserInput` prompts and
-/// `GetContractRequest`s).
+/// writes it (`ApplicationMessage` replies, `RequestUserInput` prompts,
+/// `GetContractRequest`s and `SubscribeContractRequest`s).
 fn decodeResult(bytes: []const u8) !Result {
     var r: bincode.Reader = .init(bytes);
     last_prompts = &.{};
     last_requests = &.{};
+    last_subscriptions = &.{};
     switch (try r.tag()) {
         0 => {
             var replies: std.ArrayList([]const u8) = .empty;
             var asked: std.ArrayList(delegate.UserInputRequest) = .empty;
             var requested: std.ArrayList(delegate.ContractRequest) = .empty;
+            var subscribed: std.ArrayList(types.ContractInstanceId) = .empty;
             for (0..@as(usize, @intCast(try r.int(u64)))) |_| switch (try r.tag()) {
                 0 => {
                     try replies.append(gpa, try r.bytes());
@@ -196,11 +207,18 @@ fn decodeResult(bytes: []const u8) !Result {
                     if (try r.boolean()) return error.ProcessedContractRequest; // the node would skip it
                     try requested.append(gpa, .{ .contract_id = id, .context = ctx });
                 },
+                6 => {
+                    const id = try r.array(32);
+                    _ = try r.bytes(); // context
+                    if (try r.boolean()) return error.ProcessedContractRequest; // the node would skip it
+                    try subscribed.append(gpa, id);
+                },
                 else => return error.UnsupportedOutbound,
             };
             if (r.remaining() != 0) return error.TrailingBytes;
             last_prompts = asked.items;
             last_requests = requested.items;
+            last_subscriptions = subscribed.items;
             return .{ .ok = replies.items };
         },
         1 => {

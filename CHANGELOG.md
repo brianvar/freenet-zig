@@ -4,6 +4,14 @@ What changed, and what breaks. Newest first.
 
 ## Unreleased
 
+- **delegates: `d.subscribeContract(id)`.** Sends a
+  `SubscribeContractRequest`: the node keeps the contract for the delegate,
+  across restarts, and calls it with each new state (`.unsupported`, tag 6;
+  its answer is tag 5). Subscribe only to contracts the node holds: for one
+  it doesn't, the node holds back the call's replies until it has fetched it.
+  256 per delegate. `freenet.testing.subscriptions()` shows them;
+  docs/delegates.md, "Subscribing to a contract". Breaks nothing.
+
 - **client: `putWith(..., .{ .subscribe = true })`.** The Zig client's put can
   subscribe its connection to the contract, as freenet.js `put(state, {
   subscribe: true })` does; `put` is `putWith` with the defaults (no

@@ -165,6 +165,47 @@ hash, not from an id the page passes.
 In tests, `freenet.testing.contractRequests()` lists what the last call asked
 for, and `freenet.testing.contractState(Impl, request, state, .{})` answers.
 
+## Subscribing to a contract
+
+A delegate can ask its node to keep a contract:
+
+```zig
+try d.subscribeContract(contract_id); // sent after the call's replies and reads
+```
+
+**What the node does with it (checked 2026-11-12 in freenet-core `201a62bc`,
+0.2.156; paths under `crates/core/src/`).** The subscription counts as local
+demand exactly like a connected client's (`contract.rs`,
+`record_delegate_demand`), so the node keeps hosting the contract and renews
+it on the network. Unlike a client's, it never ends: it outlives the app's
+connection, is stored, and is restored when the node restarts
+(`wasm_runtime/delegate_subscriptions.rs`, #5493). There is no unsubscribe
+yet (#5600: the node fails a call that sends `UnsubscribeContractRequest`).
+Subscribing again to a contract already subscribed changes nothing.
+
+- **The node answers in a new call**: a `SubscribeContractResponse`, which
+  reaches `handle` as `.unsupported` with tag 5. Every later change of the
+  contract calls the delegate with its new state, a `ContractNotification`
+  (tag 6). Both can be ignored; a delegate subscribed to busy contracts runs
+  on each change.
+- **Subscribe only to contracts the node holds.** For one it holds, the call's
+  replies go out at once. For one it doesn't, the node fetches it from the
+  network first and, until that finishes (up to about a minute for one that
+  isn't there), holds back the call's replies and queues every other message
+  to the delegate (`contract/delegate_park.rs`). At most 4 such network
+  subscriptions per call; the rest are refused.
+- **256 contracts per delegate** (`MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE`).
+  Past that, the node drops the subscription it notified least recently,
+  silently; a contract that never changes keeps the time it was subscribed,
+  so the oldest such one goes first. Subscribing again doesn't refresh it.
+
+The same rule as for reading applies: compute the id from the contract's code
+hash and parameters yourself rather than taking it from a page, or any page
+of the app can spend the delegate's 256 subscriptions.
+
+In tests, `freenet.testing.subscriptions()` lists what the last call
+subscribed to.
+
 ## Origin: who's asking
 
 ```zig
@@ -298,7 +339,8 @@ bytes) as parameters; see [Origin](#origin-whos-asking).
 ## Limits and notes
 
 - Calls are synchronous and should be short; the node enforces a time limit.
-- Reading a contract is wrapped (`getContract`); the other outbound requests
-  (`PutContractRequest`, `UpdateContractRequest`, `SubscribeContractRequest`,
-  `SendDelegateMessage`) aren't yet.
+- Reading a contract (`getContract`) and subscribing to one
+  (`subscribeContract`) are wrapped; the other outbound requests
+  (`PutContractRequest`, `UpdateContractRequest`, `SendDelegateMessage`)
+  aren't yet.
 - See [testing.md](testing.md) to test all of this natively.

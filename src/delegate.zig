@@ -100,7 +100,9 @@ pub const Inbound = union(enum) {
     contract_state: ContractState,
     /// Any other variant (other contract responses, notifications, lifecycle
     /// events, ...). Not decoded by this library yet; `raw` is the whole
-    /// bincode message, `tag` its variant index.
+    /// bincode message, `tag` its variant index: 5 is the node's
+    /// `SubscribeContractResponse` to `subscribeContract`, 6 a
+    /// `ContractNotification` (a subscribed contract's new state).
     unsupported: struct { tag: u32, raw: []const u8 },
 };
 
@@ -118,8 +120,10 @@ pub const Delegate = struct {
     replies: std.ArrayList([]const u8) = .empty,
     /// Prompts asked for so far, sent to the node after the replies.
     prompts: std.ArrayList(UserInputRequest) = .empty,
-    /// Contract state requests so far, sent to the node last.
+    /// Contract state requests so far, sent to the node after the prompts.
     contract_requests: std.ArrayList(ContractRequest) = .empty,
+    /// Contract subscriptions asked for so far (`subscribeContract`), sent last.
+    subscriptions: std.ArrayList(types.ContractInstanceId) = .empty,
     failure: ?[]const u8 = null,
 
     /// Reply to the app with `payload`.
@@ -177,6 +181,34 @@ pub const Delegate = struct {
     pub fn getContract(d: *Delegate, id: types.ContractInstanceId, context_: []const u8) error{ OutOfMemory, DelegateFailed }!void {
         if (context_.len > max_context_len) return d.fail("a contract request's context is at most 400 KiB");
         try d.contract_requests.append(d.allocator, .{ .contract_id = id, .context = context_ });
+    }
+
+    /// Subscribe this delegate to contract `id` (`SubscribeContractRequest`).
+    /// The node then counts the delegate as wanting the contract, like a
+    /// connected client, so it keeps hosting it and renews it on the network;
+    /// unlike a client's, the subscription has no end: it outlives the app's
+    /// connection and is restored when the node restarts (freenet-core
+    /// #4669, #5493). There is no unsubscribe yet (#5600).
+    ///
+    /// Each state change of the contract then calls the delegate with the
+    /// new state (a `ContractNotification`, reaching `handle` as
+    /// `.unsupported` with tag 6), and the node answers the request itself
+    /// with a `SubscribeContractResponse` (tag 5) in a new call; both can be
+    /// ignored. Subscribing again to a contract already subscribed changes
+    /// nothing.
+    ///
+    /// **Subscribe only to contracts the node holds.** For one it doesn't,
+    /// the node fetches it from the network first, and until that finishes
+    /// (up to about a minute for one that isn't there) it holds back this
+    /// call's replies and every further message to the delegate. At most 4
+    /// such network subscriptions per call; the node refuses the rest.
+    ///
+    /// Limits (freenet 0.2.156): 256 contracts per delegate; past that the
+    /// node drops the one it notified least recently, silently. A contract
+    /// that never changes keeps the time it was subscribed. See
+    /// docs/delegates.md, "Subscribing to a contract".
+    pub fn subscribeContract(d: *Delegate, id: types.ContractInstanceId) Allocator.Error!void {
+        try d.subscriptions.append(d.allocator, id);
     }
 
     /// Replace the delegate context (scratch state within one message batch).
@@ -275,7 +307,7 @@ pub fn Exports(comptime Impl: type) type {
                 const failed = @as(anyerror, err) == error.DelegateFailed;
                 return encodeError(.other, if (failed) (d.failure orelse "DelegateFailed") else @errorName(err));
             };
-            return encodeOk(d.replies.items, d.prompts.items, d.contract_requests.items);
+            return encodeOk(d.replies.items, d.prompts.items, d.contract_requests.items, d.subscriptions.items);
         }
     };
 }
@@ -320,17 +352,17 @@ pub fn decodeInbound(bytes: []const u8) bincode.Error!Inbound {
 
 /// `Ok(Vec<OutboundDelegateMsg>)`: one `ApplicationMessage` per reply, then
 /// one `RequestUserInput` per prompt, then one `GetContractRequest` per
-/// contract request (last: the node stops reading at the first one it
-/// hands to its executor).
-fn encodeOk(replies: []const []const u8, prompts: []const UserInputRequest, requests: []const ContractRequest) []const u8 {
+/// contract request, then one `SubscribeContractRequest` per subscription
+/// (requests last: the node hands each to its executor once the call returns).
+fn encodeOk(replies: []const []const u8, prompts: []const UserInputRequest, requests: []const ContractRequest, subscriptions: []const types.ContractInstanceId) []const u8 {
     var w: bincode.Writer = .init(abi.allocator);
-    encodeOutbound(&w, replies, prompts, requests) catch @trap();
+    encodeOutbound(&w, replies, prompts, requests, subscriptions) catch @trap();
     return w.items();
 }
 
-fn encodeOutbound(w: *bincode.Writer, replies: []const []const u8, prompts: []const UserInputRequest, requests: []const ContractRequest) Allocator.Error!void {
+fn encodeOutbound(w: *bincode.Writer, replies: []const []const u8, prompts: []const UserInputRequest, requests: []const ContractRequest, subscriptions: []const types.ContractInstanceId) Allocator.Error!void {
     try w.tag(0); // Ok
-    try w.int(u64, replies.len + prompts.len + requests.len);
+    try w.int(u64, replies.len + prompts.len + requests.len + subscriptions.len);
     for (replies) |payload| {
         try w.tag(0); // ApplicationMessage
         try w.bytes(payload);
@@ -349,6 +381,12 @@ fn encodeOutbound(w: *bincode.Writer, replies: []const []const u8, prompts: []co
         try w.raw(&q.contract_id); // ContractInstanceId: 32 bytes, no length
         try w.bytes(q.context); // DelegateContext
         try w.boolean(false); // processed: not yet, the node fetches it
+    }
+    for (subscriptions) |id| {
+        try w.tag(6); // SubscribeContractRequest (after PutContractRequest, UpdateContractRequest)
+        try w.raw(&id); // ContractInstanceId: 32 bytes, no length
+        try w.bytes(""); // context: DelegateContext (none)
+        try w.boolean(false); // processed: not yet, the node subscribes
     }
 }
 
