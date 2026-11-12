@@ -142,7 +142,7 @@ else throws a `TypeError`.
 | `await h.update(delta)` | send `UpdateData::Delta`; your `updateState` merges it. Resolves to the new summary |
 | `await h.updateState(state)` | send `UpdateData::State`, a whole proposed state |
 | `const off = await h.subscribe(fn)` | call `fn({ state?, delta? })` (Uint8Arrays) on every change; resolves once the node confirmed; `off()` removes `fn`. The node sends the whole state each time |
-| `const f = await h.follow(fn)` | keep a copy of the state in the page, updated by deltas: `fn(state)` (Uint8Array) now and after every change; `f.state()` is the copy, `f.stop()` removes `fn`. Embedded contracts only (see below) |
+| `const f = await h.follow(fn, { resubscribeMs })` | keep a copy of the state in the page, updated by deltas: `fn(state)` (Uint8Array) now and after every change; `f.state()` is the copy, `f.stop()` removes `fn`. `resubscribeMs` (default 0): the shortest time between two Subscribes with a new summary (see below). Embedded contracts only |
 
 `state` and `delta` arguments may be strings, `Uint8Array`s (or other typed
 arrays) or `ArrayBuffer`s.
@@ -167,6 +167,13 @@ after each change (once per burst). Your `getStateDelta` then decides what
 travels. A merge that fails in the page falls back to a `get()`. The contract
 may log; any other import makes the merge fail (and fall back). One copy per
 contract and client, shared by every `follow` on it.
+
+A contract that changes several times a second would get a Subscribe after
+nearly every change. `follow(fn, { resubscribeMs: 10000 })` sends at most one
+every 10 s: changes still arrive at once, as deltas against a summary at most
+that old, so each delta may repeat lines the copy already has (your merge must
+take them again harmlessly, as a commutative, idempotent merge does). Followers
+of one contract share the copy, and the smallest `resubscribeMs` counts.
 
 `examples/counter` is the complete version.
 

@@ -108,7 +108,7 @@ async function until(cond, ms = 3000) {
   }
 }
 /** A client following contract "t" (parameters "p") whose state on the node is `state`. */
-async function following(state) {
+async function following(state, options) {
   if (typeof TEST_CONTRACT_WASM === "undefined") throw new Error("js/test-contract.js is missing: run `zig build test` first");
   fresh();
   FreenetClient.contracts = { t: { wasm: TEST_CONTRACT_WASM, codeHash: "33".repeat(32) } };
@@ -116,7 +116,7 @@ async function following(state) {
   const client = await connected();
   const sock = sockets[0];
   const seen = [];
-  const pending = client.contract("t", "p").follow((s) => seen.push(s));
+  const pending = client.contract("t", "p").follow((s) => seen.push(s), options);
   await tick();
   sock.reply(getResponse(state));
   await until(() => sock.sent.length === 2);
@@ -655,6 +655,29 @@ const tests = {
     sock.reply(SUBSCRIBED);
     await tick(20);
     assert.equal(sock.sent.length, 4);
+  },
+
+  async "resubscribeMs: changes arrive at once, the next Subscribe waits its time with the latest summary"() {
+    const { f, seen, sock } = await following("a\n", { resubscribeMs: 300 });
+    sock.reply(notification(1, "b\n"));
+    await until(() => seen.length === 2);
+    await tick(50);
+    assert.equal(sock.sent.length, 2, "no Subscribe yet: the first summary went less than 300 ms ago");
+    sock.reply(notification(1, "c\n"));
+    await until(() => seen.length === 3);
+    assert.equal(text(f.state()), "a\nb\nc\n", "merged without waiting");
+    await until(() => sock.sent.length === 3, 1000);
+    assert.equal(subscribed(sock.sent[2]), "a,b,c", "one Subscribe, the latest summary");
+    sock.reply(SUBSCRIBED);
+    // a delta against the older summary repeats lines the copy has: merged again harmlessly
+    sock.reply(notification(1, "b\nd\n"));
+    await until(() => seen.length === 4);
+    assert.equal(text(f.state()), "a\nb\nc\nd\n");
+    await tick(50);
+    assert.equal(sock.sent.length, 3, "the next one waits again");
+    await until(() => sock.sent.length === 4, 1000);
+    assert.equal(subscribed(sock.sent[3]), "a,b,c,d");
+    sock.reply(SUBSCRIBED);
   },
 
   async "a whole state replaces the copy; a failed merge fetches the state instead"() {

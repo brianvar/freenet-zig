@@ -753,16 +753,25 @@ class ContractHandle {
    * (`client.contract(name, ...)`). One copy per contract and client, shared
    * by every `follow` on it.
    *
+   * Options: `resubscribeMs` (default 0), the shortest time between two
+   * Subscribes with a new summary. A contract that changes often (several
+   * times a second) would otherwise get a Subscribe after nearly every
+   * change; with it, changes still arrive at once, as deltas against a
+   * summary at most that old (so a delta may repeat lines the copy has,
+   * which the merge takes again harmlessly). Followers of one contract share
+   * the copy; the smallest `resubscribeMs` asked for counts.
+   *
    * Resolves, once subscribed, to `{ state(), stop() }`: the current copy
    * (or null before the network has the contract), and a function that
    * removes `onState`.
    */
-  async follow(onState) {
+  async follow(onState, { resubscribeMs = 0 } = {}) {
     if (!this._wasm) throw new Error("follow needs the contract code: use client.contract(name, ...) with an embedded contract");
     const c = this.client;
     const idHex = bytesToHex(this.id);
     let f = c._followers.get(idHex);
-    if (!f) c._followers.set(idHex, f = new Follower(this, c._runner(this.codeHash, this._wasm)));
+    if (!f) c._followers.set(idHex, f = new Follower(this, c._runner(this.codeHash, this._wasm), resubscribeMs));
+    else f.resubscribeMs = Math.min(f.resubscribeMs, resubscribeMs);
     f.callbacks.add(onState);
     try { await f.started; } catch (err) { f.callbacks.delete(onState); throw err; }
     if (f.state !== null) {
@@ -775,18 +784,21 @@ class ContractHandle {
 /**
  * The page's copy of one contract's state (`ContractHandle.follow`). Changes
  * are handled one at a time, in arrival order; after a burst, one Subscribe
- * with the summary of the result.
+ * with the summary of the result (no sooner than `resubscribeMs` after the
+ * last one).
  */
 class Follower {
-  constructor(handle, runner) {
+  constructor(handle, runner, resubscribeMs = 0) {
     this.handle = handle;
     this.runner = runner;
+    this.resubscribeMs = resubscribeMs;
     this.state = null;
     this.callbacks = new Set();
     this._chain = Promise.resolve();
     this._pending = 0;
     this._latest = null;        // a summary waiting to be sent
-    this._subscribing = false;  // a Subscribe in flight
+    this._subscribing = false;  // a Subscribe in flight, or waiting for its time
+    this._sentAt = 0;           // when the last summary went (Date.now())
     const c = handle.client, id = handle.id, idHex = bytesToHex(id);
     this._resubscribe = (summary) => c._resubscribe(id, idHex, summary);
     this.started = (async () => {
@@ -799,6 +811,7 @@ class Follower {
       this.state = state;
       // a Subscribe of its own even if the page already subscribed: the node must get the summary.
       // What changed since the `get` comes as a delta against it.
+      this._sentAt = Date.now();
       await c._resubscribe(id, idHex, await runner.summarize(handle.parameters, state));
     })();
     this.started.catch(() => { if (c._followers.get(idHex) === this) c._followers.delete(idHex); });
@@ -830,17 +843,20 @@ class Follower {
   }
 
   // Sends the summary without holding up the next change (a Subscribe to a contract another
-  // node hosts takes a network round trip). One Subscribe in flight; meanwhile only the latest
-  // summary waits. If one fails, the node keeps the older summary and its deltas carry more; a
-  // reconnect subscribes with the latest.
+  // node hosts takes a network round trip). One Subscribe in flight, or waiting out
+  // `resubscribeMs`; meanwhile only the latest summary waits. If one fails, the node keeps the
+  // older summary and its deltas carry more; a reconnect subscribes with the latest.
   _sendSummary(summary) {
     this._latest = summary;
     if (this._subscribing) return;
     this._subscribing = true;
     (async () => {
       while (this._latest !== null) {
+        const wait = this._sentAt + this.resubscribeMs - Date.now();
+        if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
         const next = this._latest;
         this._latest = null;
+        this._sentAt = Date.now();
         await this._resubscribe(next).catch((err) => console.warn("freenet.js: follow: subscribing with the new summary failed:", err.message));
       }
       this._subscribing = false;

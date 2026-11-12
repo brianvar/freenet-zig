@@ -4,6 +4,13 @@ What changed, and what breaks. Newest first.
 
 ## Unreleased
 
+- **freenet.js: `follow(fn, { resubscribeMs })`.** The shortest time between
+  two Subscribes with a new summary (default 0: one after each burst, as
+  before). A contract that changes several times a second got a Subscribe
+  after nearly every change; with it, changes still arrive at once, as
+  deltas against a summary at most that old. Followers of one contract share
+  the copy; the smallest value counts. Breaks nothing.
+
 - **freenet.js: keepalive, catch-up, named connections.** An idle main
   connection was dropped by the node after a while (the page logged "the
   network connection was lost"); now, after `keepAliveMs` (default
