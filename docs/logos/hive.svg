@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 32 32">
+  <defs>
+    <linearGradient id="logo-fill" gradientUnits="userSpaceOnUse" x1="4" y1="3" x2="28" y2="29"><stop offset="0" stop-color="#ffcb45"/><stop offset=".55" stop-color="#ff8a3a"/><stop offset="1" stop-color="#f2557a"/></linearGradient>
+    <linearGradient id="logo-peer" gradientUnits="userSpaceOnUse" x1="4" y1="3" x2="28" y2="29"><stop offset="0" stop-color="#ff8f6b"/><stop offset="1" stop-color="#a47cff"/></linearGradient>
+  </defs>
+  <g stroke-linejoin="round" stroke-width="1.8">
+    <path d="M9.59 4.35L14.87 7.40L14.87 13.50L9.59 16.55L4.31 13.50L4.31 7.40Z" fill="url(#logo-fill)" stroke="url(#logo-fill)"/>
+    <path d="M22.41 4.35L27.69 7.40L27.69 13.50L22.41 16.55L17.13 13.50L17.13 7.40Z" fill="url(#logo-fill)" stroke="url(#logo-fill)"/>
+    <path d="M16.00 15.45L21.28 18.50L21.28 24.60L16.00 27.65L10.72 24.60L10.72 18.50Z" fill="url(#logo-peer)" stroke="url(#logo-peer)"/>
+  </g>
+</svg>

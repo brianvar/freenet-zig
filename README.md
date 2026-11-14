@@ -22,12 +22,12 @@ a Rust SDK. This library covers the same ground for Zig:
 
 Requires **Zig 0.17**.
 
-## Projects on Freenet made with freenet-zig
+## Projects made with freenet-zig
 
 | Project | What it is |
 | --- | --- |
-| [Hive](http://localhost:7509/v1/contract/web/AqiX61ZEVgTVWudkbTqDv8w57vsQ24ZhjytEGVwzas7A/) | A code host: git repositories, issues and pull requests that live on Freenet, with no central server. |
-| [Pixie](http://localhost:7509/v1/contract/web/4NMu7hGUwBswEwQQKK4H7PVbucXq6d8ERKzRRWX5RDFD/) | Image sharing, public or encrypted. |
+| ![](docs/logos/hive.svg) [Hive](http://localhost:7509/v1/contract/web/AqiX61ZEVgTVWudkbTqDv8w57vsQ24ZhjytEGVwzas7A/) | A code host: git repositories, issues and pull requests that live on Freenet, with no central server. |
+| ![](docs/logos/pixie.svg) [Pixie](http://localhost:7509/v1/contract/web/4NMu7hGUwBswEwQQKK4H7PVbucXq6d8ERKzRRWX5RDFD/) | Image sharing, public or encrypted. |
 
 The links open through your own Freenet node on its default port (7509).
 
