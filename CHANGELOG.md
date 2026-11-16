@@ -4,6 +4,13 @@ What changed, and what breaks. Newest first.
 
 ## Unreleased
 
+- **client: `lastErrorTransient()`.** Tells a node's network failure (an
+  `OperationError` such as "GET response stream assembly failed … after
+  exhausting retries", `FailedOperation`, `EmptyRing`, a contract error that
+  timed out, …) from a refusal of the request, so a caller can ask again
+  instead of giving up. The connection stays usable after either. Breaks
+  nothing.
+
 - **build: `addSignedArchive`.** Signs an archive the build made itself into
   the built-in web container (freenet-pack `--archive`): files that aren't an
   app, at an address fixed by the key (`addAppId`), each release replacing

@@ -539,11 +539,34 @@ test "client: other errors fail the request, and say why" {
     try testing.expect(std.mem.startsWith(u8, c.lastError(), "Get "));
     try testing.expect(std.mem.endsWith(u8, c.lastError(), ": timed out"));
     try testing.expectEqualStrings(id_text, c.lastError()[4 .. c.lastError().len - 11]);
+    try testing.expect(c.lastErrorTransient());
     try testing.expectError(error.NodeError, c.get(testing.allocator, id));
     try testing.expect(std.mem.startsWith(u8, c.lastError(), "MissingContract "));
+    try testing.expect(!c.lastErrorTransient());
     try testing.expectError(error.NodeError, c.get(testing.allocator, id));
     try testing.expectEqualStrings("Unhandled: boom", c.lastError());
+    try testing.expect(!c.lastErrorTransient());
     try testing.expectError(error.ConnectionClosed, c.get(testing.allocator, id)); // no more input
+}
+
+test "client: a network failure is transient, a refusal isn't" {
+    var n: FakeNode = .init();
+    defer n.deinit();
+    const cause = "GET response stream assembly failed for x after exhausting retries: stream assembly: no fragments received within inactivity timeout";
+    try n.send(&(le32(1) ++ le32(9) ++ vec(cause)), 1000); // OperationError { cause }
+    try n.send(&(le32(1) ++ le32(10)), 1000); // FailedOperation
+    try n.send(&(contract_error ++ le32(0) ++ id ++ code_hash ++ vec("invalid state")), 1000); // Get { key, cause }
+    try n.send(&(ok_contract ++ le32(5) ++ id), 1000); // NotFound: the connection still works
+    var c = n.client();
+    try testing.expectError(error.NodeError, c.get(testing.allocator, id));
+    try testing.expectEqualStrings("OperationError: " ++ cause, c.lastError());
+    try testing.expect(c.lastErrorTransient());
+    try testing.expectError(error.NodeError, c.get(testing.allocator, id));
+    try testing.expectEqualStrings("FailedOperation", c.lastError());
+    try testing.expect(c.lastErrorTransient());
+    try testing.expectError(error.NodeError, c.get(testing.allocator, id));
+    try testing.expect(!c.lastErrorTransient());
+    try testing.expect(try c.get(testing.allocator, id) == null);
 }
 
 test "client: a large state in fragments, and a streamed response" {

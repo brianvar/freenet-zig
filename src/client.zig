@@ -78,6 +78,8 @@ pub const Client = struct {
     timeout: ?Io.Duration = null,
     error_buf: [512]u8 = undefined,
     error_len: usize = 0,
+    /// See `lastErrorTransient`.
+    error_transient: bool = false,
     timeout_buf: [400]u8 = undefined,
 
     const Conn = struct {
@@ -156,6 +158,20 @@ pub const Client = struct {
     /// `error.Timeout`: "the node at <host:port> didn't answer in <n> s".
     pub fn lastError(c: *const Client) []const u8 {
         return c.error_buf[0..c.error_len];
+    }
+
+    /// Whether the last `error.NodeError` is the network's or the node's
+    /// state rather than a refusal of the request: asking again later may
+    /// work. True for the node's network failures (OperationError,
+    /// FailedOperation, EmptyRing, PeerNotJoined, NodeUnavailable,
+    /// Disconnect, ChannelClosed, TransportProtocolDisconnect, a request's
+    /// Timeout), and for a contract error whose cause says it timed out or
+    /// gave up ("GET response stream assembly failed ... after exhausting
+    /// retries: ... inactivity timeout"). False for what the request itself
+    /// caused: a refused state or delta, a contract or delegate error, a
+    /// bad request.
+    pub fn lastErrorTransient(c: *const Client) bool {
+        return c.error_transient;
     }
 
     /// The contract's current state, or null if the node doesn't have it
@@ -439,6 +455,7 @@ pub const Client = struct {
             var w: Io.Writer = .fixed(&c.error_buf);
             res.failure.format(&w) catch {};
             c.error_len = w.end;
+            c.error_transient = res.failure.isTransient();
         }
         return res;
     }
@@ -576,6 +593,7 @@ pub const Client = struct {
     }
 
     fn setError(c: *Client, comptime fmt: []const u8, args: anytype) void {
+        c.error_transient = false;
         c.error_len = if (std.fmt.bufPrint(&c.error_buf, fmt, args)) |s| s.len else |_| c.error_buf.len;
     }
 };
@@ -900,6 +918,18 @@ const Failure = struct {
         if (f.contract) |k| if (!std.mem.eql(u8, &k, &id)) return false;
         return std.mem.eql(u8, f.kind, "MissingContract") or
             (std.mem.eql(u8, f.kind, "Get") and std.ascii.findIgnoreCase(f.cause, "not found") != null);
+    }
+
+    /// See `Client.lastErrorTransient`.
+    fn isTransient(f: Failure) bool {
+        const network = [_][]const u8{ "OperationError", "FailedOperation", "EmptyRing", "PeerNotJoined", "NodeUnavailable", "Disconnect", "ChannelClosed", "TransportProtocolDisconnect", "Timeout" };
+        for (network) |k| if (std.mem.eql(u8, f.kind, k)) return true;
+        const contract = [_][]const u8{ "Get", "Put", "Update", "Subscribe" };
+        for (contract) |k| if (std.mem.eql(u8, f.kind, k)) {
+            const said = [_][]const u8{ "timed out", "timeout", "exhausting retries", "no fragments" };
+            for (said) |x| if (std.ascii.findIgnoreCase(f.cause, x) != null) return true;
+        };
+        return false;
     }
 
     fn format(f: Failure, w: *Io.Writer) Io.Writer.Error!void {
