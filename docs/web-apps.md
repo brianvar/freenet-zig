@@ -258,6 +258,13 @@ global.
   on reload, loads the iframe with that hash. After changing the hash with
   `history.replaceState` (no `hashchange`), call `FreenetClient.shareHash()`.
   Outside a shell both do nothing.
+- **Another app's page.** A sandboxed page can't navigate the top window.
+  `FreenetClient.navigate("/v1/contract/web/<key>/?…#…")` asks the shell to:
+  it loads that page of the same node as a top-level navigation (the address
+  bar and Back follow), and takes only contract pages of its own node. The
+  other app can send the user back the same way, with an answer in the query
+  or the fragment: the shell hands both to the page it loads
+  (`location.search`, `location.hash`).
 
 ```js
 client.close();

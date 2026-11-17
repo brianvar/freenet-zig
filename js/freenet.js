@@ -151,6 +151,20 @@ class FreenetClient {
     window.parent.postMessage({ __freenet_shell__: true, type: "hash", hash }, "*");
   }
 
+  /**
+   * Leaves this page for another one on the same node, through the shell
+   * page: `href` is a path on the node (`/v1/contract/web/<key>/…`, with a
+   * query and a fragment if any). The shell loads it as a top-level
+   * navigation, so the address bar and Back follow; it takes only contract
+   * pages of its own node. A sandboxed page can't navigate the top window
+   * itself. Outside a shell it sets `location.href`.
+   */
+  static navigate(href) {
+    if (typeof window === "undefined") return;
+    if (!window.parent || window.parent === window) { location.href = href; return; }
+    window.parent.postMessage({ __freenet_shell__: true, type: "navigate", href }, "*");
+  }
+
   // ---- delegates ----
 
   /** Register an embedded delegate (once) and return a handle to message it. */
