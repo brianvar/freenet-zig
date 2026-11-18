@@ -4,6 +4,16 @@ What changed, and what breaks. Newest first.
 
 ## Unreleased
 
+- **`freenet.time`: the node's clock, for delegates.** `nowMs()` and
+  `nowSeconds()` (UTC, since 1970), or null when there is none to read.
+  The node writes a raw Rust `chrono::DateTime<Utc>` (freenet-stdlib's
+  `time::now` transmutes it back), not a fixed format: this decodes chrono
+  0.4.45's layout, the node's, and checks every part of it (year, day of
+  the year against the leap flag, weekday flags, seconds, nanoseconds), so a
+  changed layout reads as null, never as a wrong time. Contracts mustn't
+  read it (freenet-core #5465). Tests: `freenet.testing.setClock(ms)`
+  (`reset` sets 2025-01-01). Breaks nothing.
+
 - **client: `lastErrorTransient()`.** Tells a node's network failure (an
   `OperationError` such as "GET response stream assembly failed … after
   exhausting retries", `FailedOperation`, `EmptyRing`, a contract error that

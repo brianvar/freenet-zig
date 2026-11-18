@@ -37,6 +37,7 @@ pub const RelatedRequest = contract.RelatedRequest;
 // ---- host functions ----
 pub const random = host.random;
 pub const log = host.log;
+pub const time = host.time;
 
 // ---- identifiers ----
 pub const ContractInstanceId = types.ContractInstanceId;

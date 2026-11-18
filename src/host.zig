@@ -1,5 +1,5 @@
 //! Functions the Freenet node provides to Wasm modules: randomness, logging,
-//! and (delegates only) secrets and context.
+//! the clock, and (delegates only) secrets and context.
 //!
 //! On wasm32 these call the node's imports. In native builds (`zig build
 //! test`) they go to `native`, an in-memory stand-in that `freenet.testing`
@@ -23,6 +23,7 @@ pub fn setInstanceId(id: i64) callconv(.c) void {
 const imports = struct {
     extern "freenet_rand" fn __frnt__rand__rand_bytes(id: i64, ptr: i64, len: u32) void;
     extern "freenet_log" fn __frnt__logger__info(id: i64, ptr: i64, len: i32) void;
+    extern "freenet_time" fn __frnt__time__utc_now(id: i64, ptr: i64) void;
 
     extern "freenet_delegate_ctx" fn __frnt__delegate__ctx_len() i32;
     extern "freenet_delegate_ctx" fn __frnt__delegate__ctx_read(ptr: i64, len: i32) i32;
@@ -89,6 +90,61 @@ pub const random = struct {
             const v: u64 = try int(u32);
             if (v < limit) return @intCast(@as(i64, lo) + @as(i64, @intCast(v % span)));
         }
+    }
+};
+
+// ---- the clock --------------------------------------------------------------
+
+/// The node's wall clock (UTC).
+///
+/// Only use this in delegates: a contract must compute the same result on
+/// every peer, and the node deprecates contracts reading the clock (a call
+/// from a contract will trap: freenet-core #5465).
+pub const time = struct {
+    /// Milliseconds since 1970-01-01 UTC by the node's clock, or null when
+    /// the node gives none this library can read (no instance id, or a value
+    /// that doesn't decode: see `decodeChrono`).
+    pub fn nowMs() ?i64 {
+        if (abi.is_wasm) {
+            if (instance_id == -1) return null;
+            // the node writes `size_of::<DateTime<Utc>>()` bytes (12 today); room to spare
+            var buf: [32]u8 align(8) = @splat(0);
+            imports.__frnt__time__utc_now(instance_id, p(&buf));
+            return decodeChrono(buf[0..12].*);
+        }
+        return native.clock_fn();
+    }
+
+    /// Seconds since 1970-01-01 UTC by the node's clock, or null (`nowMs`).
+    pub fn nowSeconds() ?i64 {
+        return @divFloor(nowMs() orelse return null, 1000);
+    }
+
+    /// The node writes a raw Rust `chrono::DateTime<Utc>` (freenet-stdlib's
+    /// `time::now` transmutes it back): no stable format, so this decodes
+    /// chrono 0.4.45's in-memory layout (the node's: `strings freenet-bin |
+    /// grep chrono-0.4`) and checks every part of it. Three little-endian
+    /// 4-byte words in declaration order: the date's `yof` (`(year << 13) |
+    /// (ordinal << 4) | flags`: bit 3 is 0 in a leap year, bits 0-2 a
+    /// weekday never 0), the time's `secs` (since midnight) and `frac`
+    /// (nanoseconds; 1e9 to 2e9 in a leap second). A layout that changed
+    /// fails the checks (another word read as the date names no plausible
+    /// year), so this answers null rather than a wrong time.
+    pub fn decodeChrono(b: [12]u8) ?i64 {
+        const yof = std.mem.readInt(i32, b[0..4], .little);
+        const secs = std.mem.readInt(u32, b[4..8], .little);
+        const frac = std.mem.readInt(u32, b[8..12], .little);
+        const year = yof >> 13;
+        const ordinal: u32 = @intCast((yof >> 4) & 0x1ff);
+        const flags = yof & 0xf;
+        if (year < 2000 or year > 9999) return null;
+        const leap = (@mod(year, 4) == 0 and @mod(year, 100) != 0) or @mod(year, 400) == 0;
+        if (ordinal < 1 or ordinal > @as(u32, if (leap) 366 else 365)) return null;
+        if (((flags & 0b1000) == 0) != leap or (flags & 0b111) == 0) return null;
+        if (secs >= 86_400 or frac >= 2_000_000_000) return null;
+        const y: i64 = year - 1;
+        const days = 365 * (y - 1969) + (@divFloor(y, 4) - 492) - (@divFloor(y, 100) - 19) + (@divFloor(y, 400) - 4) + (ordinal - 1);
+        return days * 86_400_000 + @as(i64, secs) * 1000 + @min(frac, 999_999_999) / 1_000_000;
     }
 };
 
@@ -201,6 +257,8 @@ pub const native = struct {
     pub var gpa: std.mem.Allocator = std.heap.smp_allocator;
     pub var rand_fn: *const fn ([]u8) void = &defaultRand;
     pub var log_fn: *const fn ([]const u8) void = &defaultLog;
+    pub var clock_fn: *const fn () ?i64 = &defaultClock;
+    pub var clock_ms: ?i64 = 1_735_689_600_000; // 2025-01-01T00:00:00Z: fixed, so tests repeat
     pub var secrets: std.StringHashMapUnmanaged([]u8) = .empty;
     pub var context: std.ArrayList(u8) = .empty;
 
@@ -212,9 +270,15 @@ pub const native = struct {
 
     fn defaultLog(_: []const u8) void {}
 
+    fn defaultClock() ?i64 {
+        return clock_ms;
+    }
+
     pub fn reset() void {
         rand_fn = &defaultRand;
         log_fn = &defaultLog;
+        clock_fn = &defaultClock;
+        clock_ms = 1_735_689_600_000;
         prng = .init(0x5eed);
         secrets = .empty; // leaks the old entries; fine for tests
         context = .empty;
@@ -234,6 +298,43 @@ test "intRange stays in range and hits both ends" {
     }
     try std.testing.expect(lo_seen and hi_seen);
     try std.testing.expectEqual(@as(i32, -3), try random.intRange(i32, -3, -3));
+}
+
+test "the node's clock: chrono 0.4.45's DateTime<Utc> decoded and checked" {
+    const make = struct {
+        fn f(yof: i32, secs: u32, frac: u32) [12]u8 {
+            var b: [12]u8 = undefined;
+            std.mem.writeInt(i32, b[0..4], yof, .little);
+            std.mem.writeInt(u32, b[4..8], secs, .little);
+            std.mem.writeInt(u32, b[8..12], frac, .little);
+            return b;
+        }
+    }.f;
+    // 2026-11-18T12:00:00.5Z: day 322 of a common year (bit 3 set), weekday flags 3
+    try std.testing.expectEqual(@as(?i64, 1_795_003_200_500), time.decodeChrono(make((2026 << 13) | (322 << 4) | 0b1011, 43_200, 500_000_000)));
+    // 1970 is outside the range read; 2024-12-31T23:59:59Z, day 366 of a leap year (bit 3 clear)
+    try std.testing.expectEqual(@as(?i64, 1_735_689_599_000), time.decodeChrono(make((2024 << 13) | (366 << 4) | 0b0010, 86_399, 0)));
+    // a leap second counts as the second before it
+    try std.testing.expectEqual(@as(?i64, 1_735_689_599_999), time.decodeChrono(make((2024 << 13) | (366 << 4) | 0b0010, 86_399, 1_500_000_000)));
+    // refused: day 366 of a common year, the leap flag wrong, no weekday, secs or frac out of range,
+    // the words in another order, all zero
+    try std.testing.expectEqual(@as(?i64, null), time.decodeChrono(make((2026 << 13) | (366 << 4) | 0b1011, 0, 0)));
+    try std.testing.expectEqual(@as(?i64, null), time.decodeChrono(make((2026 << 13) | (322 << 4) | 0b0011, 0, 0)));
+    try std.testing.expectEqual(@as(?i64, null), time.decodeChrono(make((2026 << 13) | (322 << 4) | 0b1000, 0, 0)));
+    try std.testing.expectEqual(@as(?i64, null), time.decodeChrono(make((2026 << 13) | (322 << 4) | 0b1011, 86_400, 0)));
+    try std.testing.expectEqual(@as(?i64, null), time.decodeChrono(make((2026 << 13) | (322 << 4) | 0b1011, 0, 2_000_000_000)));
+    const b = make((2026 << 13) | (322 << 4) | 0b1011, 43_200, 500_000_000);
+    try std.testing.expectEqual(@as(?i64, null), time.decodeChrono(b[4..12].* ++ b[0..4].*));
+    try std.testing.expectEqual(@as(?i64, null), time.decodeChrono(@splat(0)));
+}
+
+test "the clock in native builds: freenet.testing sets it" {
+    native.reset();
+    try std.testing.expectEqual(@as(?i64, 1_735_689_600_000), time.nowMs());
+    native.clock_ms = 1_795_003_200_500;
+    try std.testing.expectEqual(@as(?i64, 1_795_003_200), time.nowSeconds());
+    native.clock_ms = null;
+    try std.testing.expectEqual(@as(?i64, null), time.nowMs());
 }
 
 test "random fails without an instance id" {

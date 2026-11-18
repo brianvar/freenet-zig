@@ -27,7 +27,7 @@ src/abi.zig             buffers, result structs, allocator, export name lists
 src/bincode.zig         bincode 1.x encoder/decoder
 src/delegate.zig        Delegate, Secrets, requireApp, exportDelegate, wire codecs
 src/contract.zig        Contract, Updates, exportContract, error mapping
-src/host.zig            node imports (random, log, context, secrets) + native stand-ins for tests
+src/host.zig            node imports (random, log, the clock, context, secrets) + native stand-ins for tests
 src/types.zig           ids, key derivation (BLAKE3), base58
 src/webapp.zig          web-app state layout, tar, stored xz, signed-site metadata (CBOR), verify/sign
 src/webcontainer.zig    the built-in signed web contract used by addWebApp

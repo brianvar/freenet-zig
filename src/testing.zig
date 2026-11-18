@@ -44,6 +44,12 @@ pub fn setLog(f: *const fn ([]const u8) void) void {
     host.native.log_fn = f;
 }
 
+/// Set the fake node's clock (`freenet.time`): milliseconds since 1970 UTC,
+/// or null for a node whose clock can't be read. `reset` sets 2025-01-01.
+pub fn setClock(ms: ?i64) void {
+    host.native.clock_ms = ms;
+}
+
 /// Simulate a node that never called `__frnt_set_id` (random then fails).
 pub fn clearInstanceId() void {
     host.setInstanceId(-1);
