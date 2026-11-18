@@ -346,7 +346,7 @@ The same container signs other files at a fixed address too: `addSignedArchive`
 (see [build.md](build.md#addsignedarchive)) for downloads or a static page,
 with a key of its own.
 
-The layout helpers in `freenet.webapp` (`tar`, `xzStore`, `buildState`,
+The layout helpers in `freenet.webapp` (`tar`, `xzCompress`, `xzStore`, `buildState`,
 `parseState`, `signState`, `verifyState`) help if you write your own container.
 
 ## State layout
@@ -355,10 +355,13 @@ The layout helpers in `freenet.webapp` (`tar`, `xzStore`, `buildState`,
 [u64 BE metadata length][metadata][u64 BE archive length][archive: tar.xz with index.html at the root]
 ```
 
-The archive is a valid `.xz` that stores the data uncompressed. Zig has no xz
-encoder, and this keeps the build free of external tools. Sites are larger as
-a result, and embedded Wasm grows by a third as base64. The node stores at most
-50 MiB per state; `freenet-pack` fails above that.
+`freenet-pack` compresses the archive with freenet-zig's own LZMA2 encoder
+(`webapp.xzCompress`; Zig's std reads xz but has no encoder, and this keeps
+the build free of external tools). It is deterministic, so a site rebuilds
+byte for byte, and a little larger than `xz -6`. Embedded Wasm is base64 in
+`freenet.js`, which compression mostly takes back. The node stores at most
+50 MiB per state; `freenet-pack` fails above that. `xzStore` writes the same
+container without compression, for archives whose readers expect that form.
 
 ## Publishing
 

@@ -24,7 +24,7 @@
 //!   check `d.origin` (`Delegate.requireApp`). The id is
 //!   BLAKE3(BLAKE3(web container code) ‖ public key): it does not depend on
 //!   the site, so it stays the same across releases.
-//! * The files are packed into `web.tar.xz`, signed with the key as release
+//! * The files are packed into `web.tar.xz` (compressed: `webapp.xzCompress`), signed with the key as release
 //!   `--version` (default: the current Unix time) and stored as the state.
 //! * In the `.html` files, `src="name"` and `href="name"` that name a packed
 //!   file (freenet.js included) become `name?v=<release>`: the node serves a
@@ -210,10 +210,10 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.endsWith(u8, f.name, ".html")) f.data = try freenet.webapp.versionRefs(arena, f.data, names, release);
     }
 
-    const archive = try freenet.webapp.xzStore(arena, try freenet.webapp.tar(arena, packed_files.items));
+    const archive = try freenet.webapp.xzCompress(arena, try freenet.webapp.tar(arena, packed_files.items));
     const state = try freenet.webapp.signState(arena, key_pair, release, archive);
     if (state.len > freenet.webapp.max_state_size)
-        return usage("the site is {d} bytes; the node stores at most {d} (archives are not compressed)", .{ state.len, freenet.webapp.max_state_size });
+        return usage("the site is {d} bytes, compressed; the node stores at most {d}", .{ state.len, freenet.webapp.max_state_size });
     var b58: [64]u8 = undefined;
     const key = freenet.types.encodeBase58(&b58, &app_id);
 

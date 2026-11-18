@@ -17,6 +17,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Crc32 = std.hash.Crc32;
 const Ed25519 = std.crypto.sign.Ed25519;
+const lzma2 = @import("lzma2.zig");
 
 pub const File = struct {
     /// Path inside the archive, `/`-separated (e.g. `index.html`, `img/a.png`).
@@ -218,12 +219,55 @@ pub fn signState(gpa: Allocator, key_pair: Ed25519.KeyPair, version: u32, archiv
 
 /// Wraps `data` in a valid .xz stream without compressing it: one block of
 /// LZMA2 "uncompressed" chunks with a CRC32 check. Every xz reader (the node
-/// uses liblzma) accepts it; it is just not smaller. Zig's std has no xz
-/// encoder, and this keeps builds free of external tools.
+/// uses liblzma) accepts it; it is just not smaller. Content-addressed
+/// archives (a push, a chunk) keep this form: their readers expect it, and
+/// it never changes. A web app's site is compressed instead (`xzCompress`).
 /// Format: https://tukaani.org/xz/xz-file-format.txt
 pub fn xzStore(gpa: Allocator, data: []const u8) Allocator.Error![]u8 {
     std.debug.assert(data.len > 0);
+    var chunks: std.ArrayList(u8) = .empty;
+    defer chunks.deinit(gpa);
+    // LZMA2 uncompressed chunks (<= 64 KiB each), then the end marker
+    var rest = data;
+    var first = true;
+    while (rest.len > 0) {
+        const n = @min(rest.len, 1 << 16);
+        try chunks.append(gpa, if (first) 0x01 else 0x02); // 0x01 resets the dictionary
+        first = false;
+        var size_be: [2]u8 = undefined;
+        std.mem.writeInt(u16, &size_be, @intCast(n - 1), .big);
+        try chunks.appendSlice(gpa, &size_be);
+        try chunks.appendSlice(gpa, rest[0..n]);
+        rest = rest[n..];
+    }
+    try chunks.append(gpa, 0x00);
+    return xzWrap(gpa, data, 0x00, chunks.items); // dictionary 4 KiB
+}
+
+/// `data` as a compressed .xz stream (LZMA2, `lzma2.zig`), or stored when that
+/// is no larger. Deterministic: the same data always gives the same bytes.
+pub fn xzCompress(gpa: Allocator, data: []const u8) Allocator.Error![]u8 {
+    std.debug.assert(data.len > 0);
+    const lz = try lzma2.encode(gpa, data);
+    defer gpa.free(lz);
+    const compressed = try xzWrap(gpa, data, lzma2.dictProp(data.len), lz);
+    const stored = xzStore(gpa, data) catch |err| {
+        gpa.free(compressed);
+        return err;
+    };
+    if (compressed.len < stored.len) {
+        gpa.free(stored);
+        return compressed;
+    }
+    gpa.free(compressed);
+    return stored;
+}
+
+/// One xz stream of one block: LZMA2 (dictionary property `dict_prop`) holding
+/// the stream `lzma2_data` of `data`, with a CRC32 check.
+fn xzWrap(gpa: Allocator, data: []const u8, dict_prop: u8, lzma2_data: []const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
     const stream_flags = [2]u8{ 0x00, 0x01 }; // check type 1 = CRC32
 
     // Stream header
@@ -232,28 +276,15 @@ pub fn xzStore(gpa: Allocator, data: []const u8) Allocator.Error![]u8 {
     try appendU32(&out, gpa, Crc32.hash(&stream_flags));
 
     // Block header: size/4-1, flags (1 filter), LZMA2 (id 0x21, 1 property
-    // byte, dictionary 4 KiB), padding, CRC32
+    // byte: the dictionary), padding, CRC32
     const block_start = out.items.len;
-    const header = [8]u8{ 12 / 4 - 1, 0x00, 0x21, 0x01, 0x00, 0, 0, 0 };
+    const header = [8]u8{ 12 / 4 - 1, 0x00, 0x21, 0x01, dict_prop, 0, 0, 0 };
     try out.appendSlice(gpa, &header);
     try appendU32(&out, gpa, Crc32.hash(&header));
     const header_size = out.items.len - block_start;
 
-    // LZMA2 uncompressed chunks (<= 64 KiB each), then the end marker
-    var rest = data;
-    var first = true;
-    while (rest.len > 0) {
-        const n = @min(rest.len, 1 << 16);
-        try out.append(gpa, if (first) 0x01 else 0x02); // 0x01 resets the dictionary
-        first = false;
-        var size_be: [2]u8 = undefined;
-        std.mem.writeInt(u16, &size_be, @intCast(n - 1), .big);
-        try out.appendSlice(gpa, &size_be);
-        try out.appendSlice(gpa, rest[0..n]);
-        rest = rest[n..];
-    }
-    try out.append(gpa, 0x00);
-    const compressed_size = out.items.len - block_start - header_size;
+    try out.appendSlice(gpa, lzma2_data);
+    const compressed_size = lzma2_data.len;
 
     // Block padding, then the check (CRC32 of the uncompressed data)
     while ((out.items.len - block_start) % 4 != 0) try out.append(gpa, 0);
@@ -365,6 +396,62 @@ test "xzStore round-trips through std's xz decoder" {
         defer testing.allocator.free(back);
         try testing.expectEqualSlices(u8, data, back);
     }
+}
+
+test "xzCompress round-trips through std's xz decoder, the same bytes every time" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(42);
+    const r = prng.random();
+    // text-like, runs, noise, and over one LZMA2 chunk's 2 MiB
+    const text = "function render(view) { return `<div class=\"card\">${esc(view.title)}</div>`; }\n";
+    const cases = [_]usize{ 1, 2, 3, 100, 4096, 70_000, 300_000, (2 << 20) + 12_345 };
+    for (cases, 0..) |len, i| {
+        const data = try a.alloc(u8, len);
+        for (data, 0..) |*b, j| b.* = switch (i % 4) {
+            0 => text[j % text.len],
+            1 => if ((j / 1000) % 2 == 0) 'a' else @truncate(j),
+            2 => r.int(u8),
+            else => if (r.uintLessThan(u8, 10) == 0) r.int(u8) else text[(j * 7) % text.len],
+        };
+        const xz = try xzCompress(a, data);
+        try testing.expectEqual(@as(usize, 0), xz.len % 4);
+        const back = try xzDecode(testing.allocator, xz);
+        defer testing.allocator.free(back);
+        try testing.expectEqualSlices(u8, data, back);
+        try testing.expectEqualSlices(u8, xz, try xzCompress(a, data));
+        // noise is stored (never larger than xzStore); text compresses well
+        if (i % 4 == 2) try testing.expect(xz.len <= (try xzStore(a, data)).len);
+        if (i % 4 == 0 and len >= 4096) try testing.expect(xz.len * 10 < len);
+    }
+}
+
+test "xzCompress: long runs, repeats of the last distance, every distance slot" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(7);
+    const r = prng.random();
+    var data: std.ArrayList(u8) = .empty;
+    const seed = try a.alloc(u8, 1 << 20);
+    r.bytes(seed);
+    try data.appendSlice(a, seed);
+    // copies from ever farther back (slots up to 2^20), of every length
+    var k: usize = 0;
+    while (k < 4000) : (k += 1) {
+        const dist = @as(usize, 1) << @intCast(r.uintLessThan(u5, 20));
+        const len = 2 + r.uintLessThan(usize, 400);
+        const from = data.items.len - @min(dist + r.uintLessThan(usize, dist), data.items.len);
+        for (0..len) |j| try data.append(a, data.items[from + j]);
+        if (k % 3 == 0) try data.append(a, r.int(u8));
+    }
+    try data.appendNTimes(a, 0, 3 << 20);
+    const xz = try xzCompress(a, data.items);
+    const back = try xzDecode(testing.allocator, xz);
+    defer testing.allocator.free(back);
+    try testing.expectEqualSlices(u8, data.items, back);
+    try testing.expect(xz.len < data.items.len / 2);
 }
 
 test "tar -> xz -> buildState -> parseState gives the files back" {
