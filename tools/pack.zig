@@ -7,7 +7,7 @@
 //!                --file index.html=<path> [--file <name>=<path>]...
 //!                [--delegate <name>=<delegate.wasm>]...
 //!                [--embed-contract <name>=<contract.wasm>]...
-//!   freenet-pack --web-contract <web_container.wasm> --key <key file> --app-id-out <file>
+//!   freenet-pack --web-contract <web_container.wasm> --key <key file> [--derive <label>] --app-id-out <file>
 //!   freenet-pack --web-contract <web_container.wasm> --key <key file> [--version <n>]
 //!                --archive <web.tar.xz> --out-dir <dir>
 //!
@@ -33,6 +33,14 @@
 //!   Parameters = the public key (what the built-in web container expects).
 //!
 //! Writes to <dir>: web_container.wasm, state.bin, params.bin, web.tar.xz, site.txt
+//!
+//! With `--derive <label>`, it signs with a key derived from the key and the
+//! label instead (BLAKE3 in key-derivation mode, `derive_context`, over the
+//! key's seed and the label): one key backed up, a site of its own for each
+//! label. A site whose code changes in a way that needs a new address (a
+//! delegate with new storage that old pages must keep reaching) takes the next
+//! label, with nothing to make or name by hand. Anyone with the key can derive
+//! every label's key, so it is one trust root, like the key itself.
 //!
 //! With `--app-id-out`, it only writes the app's id (base58, as in URLs) to
 //! that file. The id doesn't depend on the site, so a build can know it before
@@ -67,6 +75,7 @@ pub fn main(init: std.process.Init) !void {
     var out_dir: ?[]const u8 = null;
     var app_id_out: ?[]const u8 = null;
     var archive_path: ?[]const u8 = null;
+    var derive_label: ?[]const u8 = null;
     var files: std.ArrayList(Named) = .empty;
     var delegates: std.ArrayList(Named) = .empty;
     var contracts: std.ArrayList(Named) = .empty;
@@ -87,6 +96,9 @@ pub fn main(init: std.process.Init) !void {
             key_path = value;
         } else if (std.mem.eql(u8, arg, "--app-id-out")) {
             app_id_out = value;
+        } else if (std.mem.eql(u8, arg, "--derive")) {
+            if (value.len == 0) return usage("--derive needs a label", .{});
+            derive_label = value;
         } else if (std.mem.eql(u8, arg, "--archive")) {
             archive_path = value;
         } else if (std.mem.eql(u8, arg, "--version")) {
@@ -120,7 +132,8 @@ pub fn main(init: std.process.Init) !void {
     }.f;
 
     // The signing key, and the web app's id (see the module comment).
-    const key_pair = try readKey(io, arena, init.environ_map, key_path.?);
+    const read_pair = try readKey(io, arena, init.environ_map, key_path.?);
+    const key_pair = if (derive_label) |label| try derivedKey(read_pair, label) else read_pair;
     const public_key = key_pair.public_key.toBytes();
     const contract_wasm = try read(io, arena, contract_path.?);
     const app_id = freenet.types.contractInstanceId(contract_wasm, &public_key);
@@ -163,7 +176,7 @@ pub fn main(init: std.process.Init) !void {
         const wasm = try read(io, arena, d.path);
         const key = freenet.types.delegateKey(wasm, &app_id);
         try cw.print("{s}\n  \"{s}\": {{ wasm: \"{s}\", key: \"{s}\", codeHash: \"{s}\", parameters: \"{s}\" }}", .{
-            if (n == 0) "" else ",",              d.name,                                           try base64(arena, wasm),
+            if (n == 0) "" else ",",              d.name,                                     try base64(arena, wasm),
             &std.fmt.bytesToHex(key.key, .lower), &std.fmt.bytesToHex(key.code_hash, .lower), &std.fmt.bytesToHex(app_id, .lower),
         });
         var b58: [64]u8 = undefined;
@@ -291,6 +304,40 @@ fn readKey(io: Io, arena: std.mem.Allocator, env: anytype, name: []const u8) !Ed
     if (hex.len != seed.len * 2) return fail("{s} is not a signing key (expected 64 hex characters)", .{path});
     _ = std.fmt.hexToBytes(&seed, hex) catch return fail("{s} is not a signing key (expected 64 hex characters)", .{path});
     return Ed25519.KeyPair.generateDeterministic(seed) catch return fail("{s} is not a usable signing key", .{path});
+}
+
+/// The context of `--derive`'s BLAKE3 key derivation: fixed for good, since
+/// every derived site's address depends on it.
+const derive_context = "freenet-zig 2026-11-19 a web app's signing key derived for a label";
+
+/// The key `--derive <label>` signs with: BLAKE3 in key-derivation mode over
+/// `key`'s 32-byte seed and then `label` (the seed's fixed length keeps the two
+/// apart), as an Ed25519 seed.
+fn derivedKey(key: Ed25519.KeyPair, label: []const u8) error{InvalidKey}!Ed25519.KeyPair {
+    var kdf = std.crypto.hash.Blake3.initKdf(derive_context, .{});
+    kdf.update(&key.secret_key.seed());
+    kdf.update(label);
+    var seed: [Ed25519.KeyPair.seed_length]u8 = undefined;
+    kdf.final(&seed);
+    return Ed25519.KeyPair.generateDeterministic(seed) catch fail("the key derived for {s} is not usable", .{label});
+}
+
+test "derivedKey: one key per label, the same every time, none the key itself" {
+    const base = try Ed25519.KeyPair.generateDeterministic(@splat(7));
+    const one = try derivedKey(base, "console 1");
+    try std.testing.expectEqualSlices(u8, &one.public_key.toBytes(), &(try derivedKey(base, "console 1")).public_key.toBytes());
+    try std.testing.expect(!std.mem.eql(u8, &one.public_key.toBytes(), &(try derivedKey(base, "console 2")).public_key.toBytes()));
+    try std.testing.expect(!std.mem.eql(u8, &one.public_key.toBytes(), &base.public_key.toBytes()));
+    // another key gives another key for the same label
+    const other = try Ed25519.KeyPair.generateDeterministic(@splat(8));
+    try std.testing.expect(!std.mem.eql(u8, &one.public_key.toBytes(), &(try derivedKey(other, "console 1")).public_key.toBytes()));
+    // pinned: a changed derivation would move every derived site
+    var want: [32]u8 = undefined;
+    var kdf = std.crypto.hash.Blake3.initKdf(derive_context, .{});
+    kdf.update(&base.secret_key.seed());
+    kdf.update("console 1");
+    kdf.final(&want);
+    try std.testing.expectEqualSlices(u8, &(try Ed25519.KeyPair.generateDeterministic(want)).public_key.toBytes(), &one.public_key.toBytes());
 }
 
 fn fail(comptime fmt: []const u8, args: anytype) error{InvalidKey} {

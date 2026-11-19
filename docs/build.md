@@ -53,6 +53,16 @@ page is built (it depends only on the key and the web container). Use it to put
 a link back to the app (`/v1/contract/web/<id>/`) into content the app creates.
 Needs the key, like `addWebApp`.
 
+### addDerivedAppId
+
+```zig
+const next_id = freenet.addDerivedAppId(b, dep, "myapp", "release 2");
+```
+
+The same for the key `key_label` derives (see
+[web-apps.md](web-apps.md#one-key-many-sites)): known before that site is built
+or published, so one release can name the address of the next.
+
 ### addSignedArchive
 
 ```zig

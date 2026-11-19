@@ -4,6 +4,14 @@ What changed, and what breaks. Newest first.
 
 ## Unreleased
 
+- **build: one key, many sites.** `key_label` in `addWebApp` and
+  `addSignedArchive` signs with a key derived from `signing_key` for the label
+  (freenet-pack `--derive <label>`: BLAKE3 key derivation over the key's seed
+  and the label), and `addDerivedAppId` gives that site's id before it is
+  built. For an app that must move to a new address now and then (a delegate
+  whose storage starts empty while the old site keeps working), with one key to
+  back up. docs/web-apps.md, "One key, many sites". Breaks nothing.
+
 - **`freenet.time`: the node's clock, for delegates.** `nowMs()` and
   `nowSeconds()` (UTC, since 1970), or null when there is none to read.
   The node writes a raw Rust `chrono::DateTime<Utc>` (freenet-stdlib's

@@ -291,6 +291,29 @@ For CI you can pass a file path instead of a name (a value containing `/` or
 `\`, or ending in `.toml` or `.key`). The file is an `fdev` key file or just the
 32-byte seed as 64 hex characters (`openssl rand -hex 32`).
 
+### One key, many sites
+
+A site's address comes from its key, and a delegate's key from its code and the
+app's id. So an app whose delegate must change without its old pages losing it
+(a new build whose storage starts empty while the old one still has work to do)
+has to move the new build to a new address, and keep the old site as it was.
+Instead of a key per address, give one key and a label per site:
+
+```zig
+const app = freenet.addWebApp(b, dep, .{
+    .page = b.path("web/index.html"),
+    .signing_key = "my-app",
+    .key_label = "release 2",                   // signs with a key derived for this label
+});
+const next = freenet.addDerivedAppId(b, dep, "my-app", "release 3"); // the next site's id, now
+```
+
+`freenet-pack --derive <label>` derives the key: BLAKE3 in key-derivation mode
+(a fixed context) over the key's seed and the label. The same key and label
+always give the same key, so builds are repeatable. Anyone with the key can
+derive every label's key, so the key is still the one thing to keep safe and
+back up.
+
 **Keep it private and back it up**: whoever has it can replace your site, and
 if you lose it you can never update the site again. Don't commit it. The
 address `fdev` prints is for freenet's container; this library's container has

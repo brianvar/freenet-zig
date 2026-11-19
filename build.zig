@@ -128,6 +128,10 @@ pub const WebAppOptions = struct {
     /// machine that has the key. It decides the app's id and who may publish
     /// updates.
     signing_key: []const u8,
+    /// Sign with a key derived from `signing_key` for this label instead
+    /// (freenet-pack `--derive`): one key, a site of its own per label, for an
+    /// app that must move to a new address now and then (docs/web-apps.md).
+    key_label: ?[]const u8 = null,
     /// Release number; each release must be higher than the one before.
     /// Default: the Unix time of the build.
     version: ?u32 = null,
@@ -165,6 +169,7 @@ pub fn addWebApp(b: *Build, dep: *Build.Dependency, options: WebAppOptions) WebA
     run.addArg("--client");
     run.addFileArg(dep.path("js/freenet.js"));
     run.addArgs(&.{ "--key", options.signing_key });
+    if (options.key_label) |label| run.addArgs(&.{ "--derive", label });
     // The key is read from outside the build, so a cached result could be
     // for another key; always pack again (every build is a new release).
     run.has_side_effects = true;
@@ -207,10 +212,22 @@ fn webContainer(b: *Build, dep: *Build.Dependency) *Build.Step.Compile {
 /// page is built, for instance to link back to the app from content it creates.
 /// Like `addWebApp`, it needs the key on the building machine.
 pub fn addAppId(b: *Build, dep: *Build.Dependency, signing_key: []const u8) Build.LazyPath {
+    return appId(b, dep, signing_key, null);
+}
+
+/// The id of the web app signed with the key derived from `signing_key` for
+/// `label` (`key_label` in `addWebApp`): known before the site is built or
+/// published, so one release can name the address of the next.
+pub fn addDerivedAppId(b: *Build, dep: *Build.Dependency, signing_key: []const u8, label: []const u8) Build.LazyPath {
+    return appId(b, dep, signing_key, label);
+}
+
+fn appId(b: *Build, dep: *Build.Dependency, signing_key: []const u8, label: ?[]const u8) Build.LazyPath {
     const run = b.addRunArtifact(dep.artifact("freenet-pack"));
     run.addArg("--web-contract");
     run.addArtifactArg2(webContainer(b, dep), .{});
     run.addArgs(&.{ "--key", signing_key });
+    if (label) |l| run.addArgs(&.{ "--derive", l });
     run.has_side_effects = true; // the key is read from outside the build
     run.addArg("--app-id-out");
     return run.addOutputFileArg2("app_id.txt", .{});
@@ -221,6 +238,8 @@ pub const SignedArchiveOptions = struct {
     /// key of its own: the same key and container make the same id, so a key
     /// that also signs a web app would put both at one address.
     signing_key: []const u8,
+    /// Sign with a key derived from `signing_key` for this label, as for `addWebApp`.
+    key_label: ?[]const u8 = null,
     /// A stored .xz around a tar (`freenet.webapp.xzStore(freenet.webapp.tar(...))`),
     /// made by the build. Signed as it is: nothing is added or rewritten.
     archive: Build.LazyPath,
@@ -249,6 +268,7 @@ pub fn addSignedArchive(b: *Build, dep: *Build.Dependency, options: SignedArchiv
     run.addArg("--web-contract");
     run.addArtifactArg2(contract, .{});
     run.addArgs(&.{ "--key", options.signing_key });
+    if (options.key_label) |label| run.addArgs(&.{ "--derive", label });
     run.has_side_effects = true; // the key is read from outside the build
     if (options.version) |v| {
         run.addArg("--version");
