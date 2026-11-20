@@ -4,6 +4,14 @@ What changed, and what breaks. Newest first.
 
 ## Unreleased
 
+- **client: an empty state can read as "not there".** `emptyIsMissing` in
+  freenet.js's `connect` and `empty_is_missing` in the Zig client's `Options`:
+  `get` answers null for a zero-length state too, and freenet.js's `follow`
+  takes no zero-length state. For an app none of whose contracts ever holds
+  zero bytes, where a zero-length state is a contract nobody put a state of
+  its own into yet (or one a stranger put empty), never a valid empty one.
+  Off by default. Breaks nothing.
+
 - **build: one key, many sites.** `key_label` in `addWebApp` and
   `addSignedArchive` signs with a key derived from `signing_key` for the label
   (freenet-pack `--derive <label>`: BLAKE3 key derivation over the key's seed

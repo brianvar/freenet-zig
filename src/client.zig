@@ -61,6 +61,12 @@ pub const Options = struct {
     /// itself is left to the system (Zig 0.17's `ConnectOptions.timeout` is
     /// not implemented on POSIX); a node that isn't running refuses at once.
     timeout: ?Io.Duration = null,
+    /// `get` answers null ("not there") for a zero-length state too. For an
+    /// app none of whose contracts ever holds zero bytes (every empty state
+    /// has a header line, say): then zero bytes is a contract nobody put a
+    /// state of its own into yet, which code would otherwise read as a valid
+    /// empty one.
+    empty_is_missing: bool = false,
 };
 
 pub const Client = struct {
@@ -76,6 +82,8 @@ pub const Client = struct {
     fixed_mask: ?[4]u8 = null,
     /// See `Options.timeout`. Only for connections `connect` opened.
     timeout: ?Io.Duration = null,
+    /// See `Options.empty_is_missing`.
+    empty_is_missing: bool = false,
     error_buf: [512]u8 = undefined,
     error_len: usize = 0,
     /// See `lastErrorTransient`.
@@ -120,6 +128,7 @@ pub const Client = struct {
         var c: Client = .init(gpa, io, &conn.reader.interface, &conn.writer.interface);
         c.conn = conn;
         c.timeout = options.timeout;
+        c.empty_is_missing = options.empty_is_missing;
         c.arm();
         c.handshake(host, port) catch |err| {
             if (err == error.HandshakeFailed) std.log.scoped(.freenet).err("websocket handshake: {s}", .{c.lastError()});
@@ -194,6 +203,7 @@ pub const Client = struct {
             defer if (!keep) gpa.free(msg);
             switch (try c.parse(msg)) {
                 .get => |g| if (std.mem.eql(u8, &g.key.id, &id)) {
+                    if (g.state.len == 0 and c.empty_is_missing) return null;
                     // The state ends the message: move it to the front and
                     // shrink, rather than copy up to 50 MiB.
                     const len = g.state.len;

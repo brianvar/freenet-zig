@@ -73,7 +73,11 @@ class FreenetClient {
    * with status one of "connecting" | "open" | "closed", lanes (default
    * `FreenetClient.lanes`: extra connections for contract gets, puts and
    * updates, opened when first needed; see `_contractRequest`), keepAliveMs
-   * (default `FreenetClient.keepAliveMs`). After a reconnect, every
+   * (default `FreenetClient.keepAliveMs`), emptyIsMissing (default false:
+   * `get` answers null, "not there", for a zero-length state too, and a
+   * follower takes no zero-length state; for an app none of whose contracts
+   * ever holds zero bytes, where zero bytes is a contract nobody put a state
+   * of its own into yet, not a valid empty one). After a reconnect, every
    * subscribed contract is read again and its listeners get the state, so a
    * change made while disconnected isn't missed.
    */
@@ -82,8 +86,9 @@ class FreenetClient {
     return client._open().then(() => client);
   }
 
-  constructor({ url, reconnect = true, onStatus = () => {}, lanes = FreenetClient.lanes, keepAliveMs = FreenetClient.keepAliveMs, name = "main" } = {}) {
+  constructor({ url, reconnect = true, onStatus = () => {}, lanes = FreenetClient.lanes, keepAliveMs = FreenetClient.keepAliveMs, name = "main", emptyIsMissing = false } = {}) {
     this.url = url ?? FreenetClient.defaultUrl();
+    this.emptyIsMissing = !!emptyIsMissing;
     this.reconnect = reconnect;
     this.onStatus = onStatus;
     this.name = name;                // "main", or "lane N": warnings say which connection
@@ -737,6 +742,7 @@ class ContractHandle {
     }
     if (res.kind === "notFound") return null;
     this.codeHash ??= res.key.codeHash;
+    if (this.client.emptyIsMissing && res.state.length === 0) return null; // see `connect`
     return res.state;
   }
 
@@ -868,7 +874,7 @@ class Follower {
     const { handle, runner } = this;
     let state = null;
     try {
-      if (update.state) state = update.state;
+      if (update.state && !(update.state.length === 0 && handle.client.emptyIsMissing)) state = update.state;
       else if (update.delta && this.state !== null) state = await runner.merge(handle.parameters, this.state, update.delta);
     } catch (err) {
       console.warn("freenet.js: follow: merging a delta failed; fetching the state:", err.message);

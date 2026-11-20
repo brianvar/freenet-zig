@@ -348,6 +348,21 @@ const tests = {
     assert.equal(sockets.length, 2, "the timeout reconnected nothing");
   },
 
+  async "a zero-length state: empty bytes, or null with emptyIsMissing"() {
+    for (const emptyIsMissing of [false, true]) {
+      fresh();
+      FreenetClient.contracts = { t: { wasm: "AA==", codeHash: "33".repeat(32) } };
+      const client = await connected({ reconnect: false, emptyIsMissing });
+      const got = client.contract("t", "p").get();
+      await tick();
+      sockets[0].reply(getResponse(""));
+      const state = await got;
+      if (emptyIsMissing) assert.equal(state, null);
+      else assert.equal(state.length, 0);
+      client.close();
+    }
+  },
+
   async "subscriptions stay on the main connection; lanes close when idle"() {
     fresh();
     FreenetClient.contracts = { c: { wasm: "AA==", codeHash: "33".repeat(32) } };

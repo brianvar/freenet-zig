@@ -526,6 +526,19 @@ test "client: the ways a node says it doesn't have the contract" {
     }
 }
 
+test "client: a zero-length state, and empty_is_missing" {
+    for ([_]bool{ false, true }) |missing| {
+        var n: FakeNode = .init();
+        defer n.deinit();
+        try n.send(&getResponse(id, ""), 1000);
+        var c = n.client();
+        c.empty_is_missing = missing;
+        const got = try c.get(testing.allocator, id);
+        defer if (got) |st| testing.allocator.free(st);
+        if (missing) try testing.expect(got == null) else try testing.expectEqual(@as(usize, 0), got.?.len);
+    }
+}
+
 test "client: other errors fail the request, and say why" {
     var n: FakeNode = .init();
     defer n.deinit();

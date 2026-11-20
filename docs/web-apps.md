@@ -70,6 +70,7 @@ Connects to the node that served the page. Options:
 | `onStatus(s)` | no-op | called with `"connecting"`, `"open"` or `"closed"` (the main connection) |
 | `lanes` | `FreenetClient.lanes` (4) | extra connections for contract gets, puts and updates, so a slow one holds up only its own lane (see Ordering); 0 sends everything on the main connection |
 | `keepAliveMs` | `FreenetClient.keepAliveMs` (30 s) | when nothing went over the main connection for this long, a quick query keeps it from being dropped as idle (no answer within `FreenetClient.probeMs` reconnects); 0: never |
+| `emptyIsMissing` | `false` | `get` answers `null` ("not there") for a zero-length state too, and `follow` takes no zero-length state. For an app none of whose contracts ever holds zero bytes (each empty state has a header line, say): zero bytes is then a contract nobody put a state of its own into yet, not a valid empty one. The Zig client's `Options.empty_is_missing` is the same |
 
 Rejects if the first connection fails; nothing is retried in that case.
 
