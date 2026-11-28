@@ -45,6 +45,12 @@ class FreenetClient {
    * carry no request id). 0: everything on the one connection.
    */
   static lanes = 4;
+  /**
+   * The node's limit of subscriptions on one connection (`MAX_SUBSCRIPTIONS_PER_CLIENT`, 500 at
+   * 0.2.167), freed only when the connection closes: for a page to keep `subscriptionCount()`
+   * under (see `recycle`). The client doesn't enforce it; tests may lower it.
+   */
+  static subscriptionCap = 500;
   /** How long a lane stays open with nothing to do. */
   static laneIdleMs = 60000;
   /**
@@ -100,6 +106,8 @@ class FreenetClient {
     this._lanesOffUntil = 0;         // no new lanes before this (Date.now()): a lane didn't open in time
     this._inflight = null;           // the request awaiting an answer (one at a time)
     this._queue = Promise.resolve(); // serializes requests
+    this._pending = 0;               // requests queued or in flight on this connection (`idle`)
+    this._reopenAt = 2000;           // the delay before a reconnect (0 for `recycle`'s)
     this._registered = new Map();    // delegate name -> Promise<DelegateHandle>
     this._listeners = new Map();     // contract id hex -> Set of callbacks
     this._subscribed = new Map();    // contract id hex -> Promise (subscription on this connection)
@@ -233,6 +241,42 @@ class FreenetClient {
     });
   }
 
+  /**
+   * Subscriptions this connection holds on the node: every contract subscribed to since it
+   * opened. The node frees them only when the connection closes (there is no Unsubscribe),
+   * and refuses one past its cap (500 a connection at 0.2.167), with an error whose
+   * `subscriptionLimit` is true. A stopped `subscribe`, `follow` or `hold` still counts here
+   * until `recycle` or a reconnect.
+   */
+  subscriptionCount() {
+    return this._subscribed.size;
+  }
+
+  /** Contracts something still subscribes to (a callback or a hold): what a reconnect subscribes to again. */
+  liveSubscriptionCount() {
+    let n = 0;
+    for (const set of this._listeners.values()) if (set.size > 0) n++;
+    return n;
+  }
+
+  /** No request queued or in flight on this connection (lanes apart). */
+  idle() {
+    return this._pending === 0 && !this._inflight;
+  }
+
+  /**
+   * Reconnects now, so the node frees the subscriptions nothing uses any more and only the
+   * live ones are made again (callbacks first, holds after), every contract with a callback
+   * read again as after any reconnect. Only when `idle` and connected; returns whether it
+   * did. Call it at a quiet moment: requests made meanwhile wait for the new connection.
+   */
+  recycle() {
+    if (!this._isOpen() || !this.reconnect || this._closing || !this.idle()) return false;
+    this._reopenAt = 0;
+    this.ws.close();
+    return true;
+  }
+
   close() {
     this._closing = true;
     clearInterval(this._keepTimer);
@@ -270,14 +314,25 @@ class FreenetClient {
           const handle = await pending.catch(() => null);
           if (handle) await this._register(handle).catch((err) => console.warn("freenet.js:", err.message));
         }
+        // Contracts with a callback first; those only held (`hold`) after the page has its
+        // connection back, one at a time, so its own requests go between them.
+        const held = [];
         for (const [idHex, set] of this._listeners) {
-          if (set.size > 0) await this._ensureSubscribed(hexToBytes(idHex), idHex).catch((err) => console.warn("freenet.js:", err.message));
+          if (set.size === 0) continue;
+          if (onlyHeld(set)) { held.push(idHex); continue; }
+          await this._ensureSubscribed(hexToBytes(idHex), idHex).catch((err) => console.warn("freenet.js:", err.message));
         }
         if (this.ws !== ws) return reject(new Error("connection closed"));
         this._startKeepAlive(ws);
         this.onStatus("open");
         resolve();
         if (again) this._catchUp();
+        (async () => {
+          for (const idHex of held) {
+            if (this.ws !== ws) return;
+            if (this._listeners.get(idHex)?.size) await this._ensureSubscribed(hexToBytes(idHex), idHex).catch((err) => console.warn("freenet.js:", err.message));
+          }
+        })();
       };
       ws.onmessage = (event) => {
         // Ignore a socket we already gave up on (e.g. after a timeout).
@@ -287,7 +342,7 @@ class FreenetClient {
         if (this.ws !== ws) return;
         this.ws = null;
         clearInterval(this._keepTimer);
-        if (opened && !this._closing) {
+        if (opened && !this._closing && this._reopenAt !== 0) { // (0: `recycle`'s own reconnect)
           console.warn(`freenet.js (${this.name}): the connection to the node was lost${this._everOpened && this.reconnect ? "; reconnecting" : ""}`);
         }
         if (this._inflight) {
@@ -305,7 +360,9 @@ class FreenetClient {
         // Only a client that connected once reconnects; a failed first
         // connect just rejects `connect()`.
         if (this._everOpened && this.reconnect && !this._closing) {
-          setTimeout(() => this._open().catch(() => {}), 2000);
+          const delay = this._reopenAt;
+          this._reopenAt = 2000;
+          setTimeout(() => this._open().catch(() => {}), delay);
         }
       };
     });
@@ -389,8 +446,9 @@ class FreenetClient {
       if (this._suspect) await this._checkAlive(timeoutMs);
       return this._send(bytes, expects, timeoutMs, contract);
     };
+    this._pending++;
     const result = this._queue.then(run, run);
-    this._queue = result.catch(() => {});
+    this._queue = result.catch(() => {}).then(() => { this._pending--; });
     return result;
   }
 
@@ -466,7 +524,7 @@ class FreenetClient {
   // background: the page doesn't wait for it.
   _catchUp() {
     for (const [idHex, set] of this._listeners) {
-      if (!set.size) continue;
+      if (!set.size || onlyHeld(set)) continue; // a hold has nobody to tell
       const id = hexToBytes(idHex), contract = base58Encode(id);
       // ClientRequest::ContractOp(ContractRequest::Get { key, return_contract_code: false, subscribe: false, blocking_subscribe: false })
       const req = new Writer().u32(1).u32(2).raw(id).u8(0).u8(0).u8(0).finish();
@@ -548,6 +606,15 @@ class FreenetClient {
     return !!this.ws && this.ws.readyState === WebSocket.OPEN;
   }
 
+  // Removes a callback; a contract left with none is no longer subscribed to again after a
+  // reconnect (the node frees it then).
+  _unlisten(idHex, fn) {
+    const set = this._listeners.get(idHex);
+    if (!set) return;
+    set.delete(fn);
+    if (set.size === 0) this._listeners.delete(idHex);
+  }
+
   // Resolves when a reconnect opens the socket; rejects after `timeoutMs`.
   _reopened(timeoutMs) {
     return new Promise((resolve, reject) => {
@@ -610,7 +677,12 @@ class FreenetClient {
     // ClientRequest::ContractOp(ContractRequest::Subscribe { key, summary: Option<StateSummary> })
     const w = new Writer().u32(1).u32(3).raw(id);
     const req = (summary === null ? w.u8(0) : w.u8(1).bytes(summary)).finish();
-    return this._request(req, (r) => r.kind === "subscribed" && equalBytes(r.key.id, id), 30000, base58Encode(id));
+    return this._request(req, (r) => r.kind === "subscribed" && equalBytes(r.key.id, id), 30000, base58Encode(id)).catch((err) => {
+      // the node's per-connection cap (500 at 0.2.167: `MAX_SUBSCRIPTIONS_PER_CLIENT`), freed
+      // only when the connection closes (there is no Unsubscribe): see `recycle`
+      if (err instanceof FreenetError && /subscription limit/i.test(err.message ?? "")) err.subscriptionLimit = true;
+      throw err;
+    });
   }
 
   _runner(codeHash, wasm) {
@@ -783,7 +855,25 @@ class ContractHandle {
     if (!set) c._listeners.set(idHex, set = new Set());
     set.add(onUpdate);
     try { await c._ensureSubscribed(this.id, idHex); } catch (err) { set.delete(onUpdate); throw err; }
-    return () => set.delete(onUpdate);
+    return () => c._unlisten(idHex, onUpdate);
+  }
+
+  /**
+   * Keeps the contract subscribed with no callback, so the node keeps it (a node drops
+   * contracts nobody subscribes to). A hold reads nothing after a reconnect and is
+   * subscribed again after the contracts with callbacks. Resolves, once subscribed, to a
+   * function that ends the hold (the node frees it at the next `recycle` or reconnect).
+   */
+  async hold() {
+    const c = this.client;
+    const idHex = bytesToHex(this.id);
+    const fn = () => {};
+    fn.held = true;
+    let set = c._listeners.get(idHex);
+    if (!set) c._listeners.set(idHex, set = new Set());
+    set.add(fn);
+    try { await c._ensureSubscribed(this.id, idHex); } catch (err) { c._unlisten(idHex, fn); throw err; }
+    return () => c._unlisten(idHex, fn);
   }
 
   /**
@@ -825,7 +915,7 @@ class ContractHandle {
     if (f.state !== null) {
       try { onState(f.state); } catch (err) { console.error(err); }
     }
-    return { state: () => f.state, stop: () => f.callbacks.delete(onState) };
+    return { state: () => f.state, stop: () => f.release(onState) };
   }
 }
 
@@ -849,12 +939,15 @@ class Follower {
     this._sentAt = 0;           // when the last summary went (Date.now())
     const c = handle.client, id = handle.id, idHex = bytesToHex(id);
     this._resubscribe = (summary) => c._resubscribe(id, idHex, summary);
+    this._listener = (update) => this._enqueue(update);
+    this._stopped = false;
     this.started = (async () => {
       const state = await handle.get();
+      if (this._stopped) return;
       // notifications from here on (the listener set `subscribe` uses)
       let set = c._listeners.get(idHex);
       if (!set) c._listeners.set(idHex, set = new Set());
-      set.add((update) => this._enqueue(update));
+      set.add(this._listener);
       if (state === null) return c._ensureSubscribed(id, idHex); // the first change brings the whole state
       this.state = state;
       // a Subscribe of its own even if the page already subscribed: the node must get the summary.
@@ -862,7 +955,25 @@ class Follower {
       this._sentAt = Date.now();
       await c._resubscribe(id, idHex, await runner.summarize(handle.parameters, state));
     })();
-    this.started.catch(() => { if (c._followers.get(idHex) === this) c._followers.delete(idHex); });
+    this.started.catch(() => {
+      if (c._followers.get(idHex) === this) c._followers.delete(idHex);
+      this._stopped = true;
+      c._unlisten(idHex, this._listener); // a copy that never started takes no notifications
+    });
+  }
+
+  // `stop()` of one `follow`: the last one ends the copy, so the contract is no longer
+  // subscribed to again after a reconnect (the node frees it then: see `recycle`). A later
+  // `follow` starts a new copy.
+  release(onState) {
+    this.callbacks.delete(onState);
+    if (this.callbacks.size > 0 || this._stopped) return;
+    this._stopped = true;
+    this._latest = null;
+    const c = this.handle.client, idHex = bytesToHex(this.handle.id);
+    if (c._followers.get(idHex) === this) c._followers.delete(idHex);
+    c._summaries.delete(idHex);
+    c._unlisten(idHex, this._listener);
   }
 
   _enqueue(update) {
@@ -899,11 +1010,12 @@ class Follower {
     if (this._subscribing) return;
     this._subscribing = true;
     (async () => {
-      while (this._latest !== null) {
+      while (this._latest !== null && !this._stopped) {
         const wait = this._sentAt + this.resubscribeMs - Date.now();
         if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
         const next = this._latest;
         this._latest = null;
+        if (next === null || this._stopped) break;
         this._sentAt = Date.now();
         await this._resubscribe(next).catch((err) => console.warn("freenet.js: follow: subscribing with the new summary failed:", err.message));
       }
@@ -1082,6 +1194,12 @@ function parseRequestError(r) {
 }
 
 /** Refusals from the node: `err.kind` names the node's error variant. */
+// Whether every callback on a contract is a hold (`ContractHandle.hold`).
+function onlyHeld(set) {
+  for (const fn of set) if (!fn.held) return false;
+  return true;
+}
+
 class FreenetError extends Error {
   constructor(info) {
     super(info.message);

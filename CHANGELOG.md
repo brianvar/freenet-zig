@@ -4,6 +4,19 @@ What changed, and what breaks. Newest first.
 
 ## Unreleased
 
+- **freenet.js: subscriptions a page can keep under the node's cap.** The node
+  refuses a connection's 501st subscription (`MAX_SUBSCRIPTIONS_PER_CLIENT`,
+  0.2.167) and frees them only when the connection closes; there is no
+  Unsubscribe. A `subscribe` remover and a `follow`'s last `stop()` now remove
+  their listener, so a reconnect no longer subscribes to them again; a
+  `follow` that failed to start takes no notifications. New:
+  `subscriptionCount()` (what the node counts), `liveSubscriptionCount()`,
+  `idle()`, `recycle()` (reconnect now, when idle, making only the live ones
+  again: callbacks first, holds after, one at a time), `ContractHandle.hold()`
+  (a subscription with no callback, read nothing after a reconnect), and
+  `FreenetClient.subscriptionCap` (500, for pages to stay under). A Subscribe
+  refused at the cap rejects with `err.subscriptionLimit`. Breaks nothing.
+
 - **client: an empty state can read as "not there".** `emptyIsMissing` in
   freenet.js's `connect` and `empty_is_missing` in the Zig client's `Options`:
   `get` answers null for a zero-length state too, and freenet.js's `follow`

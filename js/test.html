@@ -363,6 +363,83 @@ const tests = {
     }
   },
 
+  async "a recycle makes again only the live subscriptions: callbacks first, holds after, read nothing for a hold"() {
+    fresh();
+    FreenetClient.contracts = { c: { wasm: "AA==", codeHash: "33".repeat(32) } };
+    const client = await connected();
+    const [a, b, k] = ["a", "b", "k"].map((q) => client.contract("c", q));
+    const subscribedTo = (h) => cat(le32(0), le32(0), le32(4), cat(h.id, CODE_HASH), [1]);
+    const kindOf = (req) => hex(req.subarray(0, 8)) === hex(cat(le32(1), le32(3))) ? "sub" : hex(req.subarray(0, 8)) === hex(cat(le32(1), le32(2))) ? "get" : "other";
+    const whom = (req) => [a, b, k].find((h) => hex(req.subarray(8, 40)) === hex(h.id));
+    const made = async (h, p) => { await tick(); sockets[0].reply(subscribedTo(h)); return p; };
+    const stopA = await made(a, a.subscribe(() => {}));
+    await made(b, b.subscribe(() => {}));
+    await made(k, k.hold());
+    assert.equal(client.subscriptionCount(), 3, "three on the connection");
+    assert.equal(client.liveSubscriptionCount(), 3, "three in use");
+    stopA();
+    assert.equal(client.subscriptionCount(), 3, "a stopped one still counts until the connection closes");
+    assert.equal(client.liveSubscriptionCount(), 2, "two in use");
+    assert.ok(client.idle(), "idle");
+    assert.equal(client.recycle(), true, "recycled");
+    await until(() => sockets.length === 2, 200); // at once, not after the usual 2 s
+    assert.equal(client.subscriptionCount(), 0, "the closed connection's are gone");
+    sockets[1].open();
+    const s1 = sockets[1];
+    await until(() => s1.sent.length === 1);
+    assert.equal(kindOf(s1.sent[0]) + whom(s1.sent[0]).idString, "sub" + b.idString, "the callback's Subscribe first");
+    s1.reply(subscribedTo(b));
+    await until(() => s1.sent.length === 2);
+    assert.equal(kindOf(s1.sent[1]) + whom(s1.sent[1]).idString, "get" + b.idString, "then its catch-up read");
+    s1.reply(getResponse("now", cat(b.id, CODE_HASH)));
+    await until(() => s1.sent.length === 3);
+    assert.equal(kindOf(s1.sent[2]) + whom(s1.sent[2]).idString, "sub" + k.idString, "the hold after, with no read");
+    s1.reply(subscribedTo(k));
+    await tick(20);
+    assert.equal(s1.sent.length, 3, "nothing for the stopped one");
+    assert.equal(client.subscriptionCount(), 2, "two again");
+    client.close();
+  },
+
+  async "recycle waits for a quiet connection"() {
+    fresh();
+    const client = await connected();
+    const pending = client._request(new Uint8Array([1]), (r) => r.kind === "ok", 1000);
+    await tick();
+    assert.ok(!client.idle(), "a request in flight");
+    assert.equal(client.recycle(), false, "not while busy");
+    sockets[0].reply(OK);
+    await pending;
+    await tick();
+    assert.ok(client.idle(), "idle again");
+    client.close();
+  },
+
+  async "a Subscribe the node refuses at its cap says so"() {
+    fresh();
+    FreenetClient.contracts = { c: { wasm: "AA==", codeHash: "33".repeat(32) } };
+    const client = await connected({ reconnect: false });
+    const sub = client.contract("c", "x").subscribe(() => {});
+    await tick();
+    const cause = enc.encode("per-client subscription limit (500) reached");
+    sockets[0].reply(cat(le32(1), le32(9), u64le(cause.length), cause)); // Err(OperationError { cause })
+    await assert.rejects(sub, (e) => e.subscriptionLimit === true);
+    assert.equal(client.subscriptionCount(), 0, "not counted");
+    assert.equal(client.liveSubscriptionCount(), 0, "no callback left");
+  },
+
+  async "a stopped follow is not followed again after a recycle"() {
+    const { client, f } = await following("a\n");
+    f.stop();
+    assert.equal(client.liveSubscriptionCount(), 0, "nothing in use");
+    assert.equal(client.recycle(), true, "recycled");
+    await until(() => sockets.length === 2, 200);
+    sockets[1].open();
+    await tick(20);
+    assert.equal(sockets[1].sent.length, 0, "no Subscribe, no read");
+    client.close();
+  },
+
   async "subscriptions stay on the main connection; lanes close when idle"() {
     fresh();
     FreenetClient.contracts = { c: { wasm: "AA==", codeHash: "33".repeat(32) } };
